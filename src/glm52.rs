@@ -10,6 +10,8 @@ use serde::Deserialize;
 
 use crate::safetensors::{SafeDtype, SafeTensorIndex, SafeTensorInfo};
 
+pub mod cpu;
+
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const FP8_BLOCK: u64 = 128;
 
