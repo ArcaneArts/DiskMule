@@ -192,6 +192,40 @@ container is hundreds of gigabytes. Full out-of-core correctness, cache-budget
 sweeps, memory-pressure measurements, and reproducible performance logs require
 an explicitly authorized model acquisition and storage commitment.
 
+## DiskMule Qwen3.5/Qwen3.8 findings
+
+The installed Ollama `qwen3.8:latest` model is a suitable third architecture:
+its GGUF identifies as `qwen35`, has 64 ordinary layers plus one next-token
+prediction layer omitted from ordinary decode, and alternates three recurrent
+gated-delta layers with one full-attention layer. The implemented text graph
+therefore has 48 recurrent layers and 16 full-attention layers. It uses GPT-2
+byte BPE, partial text MRoPE, per-head Q/K normalization, causal depthwise
+convolution, recurrent matrix state, output gating, and dense SwiGLU. This is
+materially different from both existing graphs.
+
+The upstream checkpoint includes a projector, but DiskMule intentionally
+advertises text only. The projector is a distinct Ollama layer and no vision
+preprocessor or multimodal contract has been implemented.
+
+The most important graph discrepancy found during the real oracle was the
+recurrent key-head broadcast. llama.cpp's fused gated-delta operation maps a
+value head to `value_head % key_heads`; using the contiguous repetition common
+in grouped-query attention produced stable but incorrect output. With cyclic
+mapping, pinned digest
+`f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d`
+matches Ollama's greedy IDs `11, 353, 2688, 264` exactly. Metal currently
+offloads mapped matrices while recurrent and attention vector operations remain
+scalar Rust, so capability reporting correctly calls this matrix offload rather
+than a full Metal graph.
+
+The Qwen result established the common architecture boundary. Chat messages,
+cancellation, results, and profiling are shared, but tokenizer/framing, opaque
+session type, stop behavior, and generation remain architecture owned. The
+model worker no longer contains an architecture enum or model-specific
+branches. Capabilities and the sole load-time registry are in
+`src/architecture.rs`; the extension and conformance rules are recorded in
+`CONTRIBUTING_MODELS.md`.
+
 ## Shared runtime and server findings
 
 Metal model objects remain on dedicated owning threads. CLI and HTTP requests

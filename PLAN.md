@@ -315,6 +315,9 @@ the exit criterion's required full-model evidence.
 
 ### Phase 7: broaden model support
 
+Status: complete on 2026-08-18 for the pinned local `qwen3.8:latest` Q4_K_M
+GGUF and the shared architecture contract.
+
 - Add another materially different dense or MoE architecture.
 - Extract shared interfaces only after Gemma 4 and GLM-5.2 reveal genuinely
   common behavior.
@@ -323,6 +326,29 @@ the exit criterion's required full-model evidence.
 
 Exit criterion: adding a model does not require changes to unrelated storage,
 server, CLI, or session code unless it introduces a genuinely new capability.
+
+Evidence: Qwen3.5/Qwen3.8 adds a hybrid graph with 48 recurrent gated-delta
+layers, 16 full-attention layers, causal depthwise convolution, recurrent
+matrix state, text MRoPE, GPT-2 byte BPE, and dense SwiGLU. Its state and graph
+are materially different from Gemma's sliding/full attention plus routed MoE
+and GLM's MLA/DSA plus streamed MoE. For pinned digest
+`f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d`,
+the Metal matrix-offload path matches Ollama's four greedy token IDs exactly:
+`11, 353, 2688, 264`. Real CLI and HTTP chat paths match Ollama's configured
+one-token `Hello` response.
+
+After the third graph exposed the common boundary, the runtime replaced its
+model/session enums with the object-safe `LoadedArchitecture` contract and an
+opaque architecture-owned session. The shared scheduler now handles sampling,
+cancellation, queues, sessions, streaming, and profiling without model-family
+branches. A capability registry reports containers, text/multimodal scope,
+CPU/Metal level, persistent sessions, and residency through
+`GET /api/capabilities`. `CONTRIBUTING_MODELS.md` defines the extension
+checklist, fast conformance requirements, real-model oracle, and current
+three-family matrix. Qwen synthetic tests cover the tensor contract,
+tokenizer, complete CPU graph, recurrent/session behavior, cancellation,
+UTF-8 streaming, CPU/Metal parity, and shared engine. Pinned ignored tests cover
+the real graph and CLI/server worker paths.
 
 ## Verification rules
 
@@ -340,14 +366,15 @@ server, CLI, or session code unless it introduces a genuinely new capability.
 
 ## Current milestone
 
-Complete every Phase 6 task that does not require the unavailable full GLM
-checkpoint, implement Phase 7 against an already installed materially
-different Ollama model, and then request authorization for the large GLM model
-and storage commitment. These commands already work:
+All safe Phase 6 implementation work and Phase 7 are complete. The remaining
+goal blocker is the unavailable full GLM-5.2 checkpoint and the authorization
+required for its hundreds-of-gigabytes storage commitment, out-of-core oracle,
+and controlled performance sweep. These commands work:
 
 ```text
 diskmule ls
 diskmule run gemma4:26b
+diskmule run qwen3.8:latest
 diskmule rm gemma4:26b
 diskmule --serve
 ```
@@ -355,7 +382,8 @@ diskmule --serve
 `ls` identifies the Ollama-owned models, `run` provides cancellable Metal chat
 on supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
 external deletion, and `--serve` provides bounded streaming and non-streaming
-chat. GLM fixture-backed safetensors, CPU, Metal, session, profiling, and
-storage-backed expert semantics are implemented. A full Phase 6 claim still
-requires the real out-of-core model and explicit authorization for any large
-download or disk commitment.
+chat. Qwen3.8 is verified through the same CLI and server. GLM fixture-backed
+safetensors, CPU, Metal, session, profiling, and storage-backed expert
+semantics are implemented. A full Phase 6 claim still requires the real
+out-of-core model and explicit authorization for any large download or disk
+commitment.

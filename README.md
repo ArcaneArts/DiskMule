@@ -6,14 +6,16 @@ families while keeping very large routed-expert pools on storage. Rust owns the
 host runtime and GPU kernels will be written in Metal Shading Language.
 
 The current implementation includes the model-management boundary, complete
-deterministic Gemma 4 26B CPU and Metal paths, and fixture-validated GLM-5.2
-CPU/Metal execution over sharded safetensors. It can inspect and map GGUF
-tensors, discover local Ollama models without copying them, safely manage
-DiskMule-owned entries, run streaming terminal chat, retain bounded Metal KV
-state, and force routed experts through explicit storage-backed caches. The
-CLI and Ollama-compatible HTTP server share bounded model workers, persistent
-KV sessions, deterministic sampling, streaming, and cancellation. A real
-hundreds-of-gigabytes GLM-5.2 checkpoint is still required before claiming
+deterministic Gemma 4 26B CPU and Metal paths, fixture-validated GLM-5.2
+CPU/Metal execution over sharded safetensors, and the installed
+`qwen3.8:latest` Q4_K_M model through a Qwen3.5 hybrid recurrent-attention
+graph with CPU correctness execution and Metal matrix offload. It can inspect
+and map GGUF tensors, discover local Ollama models without copying them, safely
+manage DiskMule-owned entries, run streaming terminal chat, retain bounded
+generation state, and force routed experts through explicit storage-backed
+caches. The CLI and Ollama-compatible HTTP server share bounded model workers,
+persistent sessions, deterministic sampling, streaming, and cancellation. A
+real hundreds-of-gigabytes GLM-5.2 checkpoint is still required before claiming
 full-model correctness or out-of-core performance.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
@@ -49,6 +51,7 @@ GLM-5.2 safetensors snapshot directory:
 
 ```bash
 diskmule run gemma4:26b
+diskmule run qwen3.8:latest
 diskmule run /path/to/model.gguf
 diskmule run /path/to/glm-5.2-snapshot
 ```
@@ -104,9 +107,15 @@ unless `DISKMULE_BIND` explicitly selects another socket. It exposes:
 
 ```text
 GET /health
+GET /api/capabilities
 GET /api/loaded
 POST /api/chat
 ```
+
+`GET /api/capabilities` reports each registered architecture's container,
+text/multimodal boundary, session support, CPU reference, Metal offload level,
+and residency policy. It distinguishes a full Metal graph from hybrid matrix
+offload rather than presenting every backend as equivalent.
 
 `POST /api/chat` accepts the Ollama chat request shape. Streaming is the
 default and returns newline-delimited JSON; set `"stream": false` for one JSON
@@ -188,6 +197,13 @@ softcapping, greedy selection, KV reuse, cancellation checks, and phase timing.
 A syntactically valid file using an unimplemented architecture or tensor type
 is reported as unsupported rather than being presented as runnable.
 
+The Qwen3.5 module validates hybrid recurrent/full-attention layer schedules,
+GPT-2 byte-BPE metadata, Q4_K_M tensors, gated-delta recurrent state, causal
+depthwise convolution, partial MRoPE, gated Q/K normalization, dense SwiGLU,
+stop IDs, and non-thinking text chat framing. The installed Qwen3.8 checkpoint
+is multimodal upstream, but DiskMule currently advertises and implements its
+text path only; it does not claim projector or vision support.
+
 The safetensors reader validates single-file or indexed sharded snapshots
 without loading tensor payloads. The GLM-5.2 module owns tokenizer/chat framing,
 MLA compressed KV state, full/shared DSA selection history, RoPE, routing,
@@ -226,6 +242,8 @@ The expensive pinned correctness oracle is separate from the fast gate:
 cargo test --release --test gemma4_cpu_reference -- --ignored --nocapture
 cargo test --release --test gemma4_metal_reference -- --ignored --nocapture
 cargo test --release --test gemma4_server_reference -- --ignored --nocapture
+cargo test --release --test qwen35_reference -- --ignored --nocapture
+cargo test --release --test qwen35_server_reference -- --ignored --nocapture
 ```
 
 For GGUF digest
@@ -240,3 +258,14 @@ session. The server oracle runs simultaneous streaming and non-streaming
 clients, disconnect recovery, loaded-model reporting, and graceful shutdown.
 Conditions and local M4 Max results are retained in
 [`benchmarks/2026-08-18-gemma4-m4-max.md`](benchmarks/2026-08-18-gemma4-m4-max.md).
+
+For Qwen GGUF digest
+`f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d`,
+DiskMule matches Ollama's four greedy IDs exactly (`11, 353, 2688, 264`) and
+matches the configured CLI/server chat token `Hello`. The Qwen server oracle
+covers both JSON and NDJSON over the same persistent runtime session. Exact
+conditions and first-observed-versus-warm measurements are in
+[`benchmarks/2026-08-18-qwen35-m4-max.md`](benchmarks/2026-08-18-qwen35-m4-max.md).
+
+The architecture extension boundary and required conformance evidence are
+documented in [CONTRIBUTING_MODELS.md](CONTRIBUTING_MODELS.md).
