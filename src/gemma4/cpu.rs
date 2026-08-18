@@ -41,6 +41,12 @@ pub enum RuntimeError {
     #[error(transparent)]
     Glm52Tokenizer(#[from] crate::glm52::tokenizer::Glm52TokenizerError),
 
+    #[error(transparent)]
+    Qwen35(#[from] crate::qwen35::Qwen35Error),
+
+    #[error(transparent)]
+    Qwen35Tokenizer(#[from] crate::qwen35::tokenizer::Qwen35TokenizerError),
+
     #[cfg(target_os = "macos")]
     #[error(transparent)]
     Metal(#[from] MetalError),
@@ -112,7 +118,7 @@ impl CancellationFlag {
         &self.0
     }
 
-    pub(super) fn check(&self) -> Result<(), RuntimeError> {
+    pub(crate) fn check(&self) -> Result<(), RuntimeError> {
         if self.is_cancelled() {
             Err(RuntimeError::Cancelled)
         } else {

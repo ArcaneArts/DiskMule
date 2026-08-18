@@ -1,5 +1,6 @@
 //! Qwen3.5/Qwen3.8 hybrid recurrent-attention architecture contract.
 
+pub mod cpu;
 pub mod tokenizer;
 
 use crate::gguf::{GgufFile, MetadataValue, TensorType};
@@ -149,6 +150,13 @@ impl Qwen35Config {
             return Err(Qwen35Error::InvalidConfiguration(
                 "recurrent inner/value/key head dimensions are incompatible".to_owned(),
             ));
+        }
+        if self.recurrent_state_size != self.recurrent_value_head_size() {
+            return Err(Qwen35Error::InvalidConfiguration(format!(
+                "recurrent state size {} differs from value head size {}",
+                self.recurrent_state_size,
+                self.recurrent_value_head_size()
+            )));
         }
         if !self.rms_epsilon.is_finite()
             || self.rms_epsilon <= 0.0
@@ -433,7 +441,7 @@ mod tests {
         assert_eq!(config.nextn_layers, 1);
         assert_eq!(config.layer_kind(0), Qwen35LayerKind::Recurrent);
         assert_eq!(config.layer_kind(1), Qwen35LayerKind::FullAttention);
-        assert_eq!(config.recurrent_projection_size(), 6);
+        assert_eq!(config.recurrent_projection_size(), 8);
         let weights = Qwen35Weights::from_gguf(&gguf, &config).unwrap();
         assert!(matches!(
             weights.layers[0].attention,
@@ -480,7 +488,7 @@ mod tests {
             ("qwen35.feed_forward_length", MetadataValue::U32(3)),
             ("qwen35.full_attention_interval", MetadataValue::U32(2)),
             ("qwen35.ssm.inner_size", MetadataValue::U32(4)),
-            ("qwen35.ssm.state_size", MetadataValue::U32(1)),
+            ("qwen35.ssm.state_size", MetadataValue::U32(2)),
             ("qwen35.ssm.time_step_rank", MetadataValue::U32(2)),
             ("qwen35.ssm.group_count", MetadataValue::U32(1)),
             ("qwen35.ssm.conv_kernel", MetadataValue::U32(2)),
@@ -511,9 +519,9 @@ mod tests {
             push(&mut tensors, &format!("{prefix}.ffn_down.weight"), &[3, 4]);
         }
         for (name, shape) in [
-            ("attn_qkv.weight", vec![4, 6]),
+            ("attn_qkv.weight", vec![4, 8]),
             ("attn_gate.weight", vec![4, 4]),
-            ("ssm_conv1d.weight", vec![2, 6]),
+            ("ssm_conv1d.weight", vec![2, 8]),
             ("ssm_alpha.weight", vec![4, 2]),
             ("ssm_beta.weight", vec![4, 2]),
             ("ssm_dt.bias", vec![2]),
