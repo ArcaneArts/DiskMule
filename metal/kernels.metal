@@ -315,11 +315,12 @@ kernel void matvec_i4_grouped(
     constant uint &columns [[buffer(4)]],
     constant uint &scale_columns [[buffer(5)]],
     constant uint &group_size [[buffer(6)]],
-    uint row [[thread_position_in_grid]]) {
+    uint lane [[thread_index_in_threadgroup]],
+    uint row [[threadgroup_position_in_grid]]) {
     const uint row_bytes = (columns + 1) / 2;
     device const uchar *weights = encoded + row * row_bytes;
     float sum = 0.0f;
-    for (uint column = 0; column < columns; column++) {
+    for (uint column = lane; column < columns; column += 256) {
         const uchar packed = weights[column / 2];
         const uint nibble = (column & 1) == 0
             ? uint(packed & 0x0f)
@@ -328,7 +329,18 @@ kernel void matvec_i4_grouped(
         const float weight = float(int(nibble) - 8) * scales[scale_index];
         sum = fma(weight, input[column], sum);
     }
-    output[row] = sum;
+    threadgroup float partial[256];
+    partial[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        output[row] = partial[0];
+    }
 }
 
 kernel void matvec_q5_0(

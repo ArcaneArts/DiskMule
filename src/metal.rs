@@ -1047,7 +1047,7 @@ mod implementation {
                     let scale_columns_buffer =
                         self.buffer_with_data(&[count_u32(scale_columns)?])?;
                     let group_size_buffer = self.buffer_with_data(&[count_u32(group_size)?])?;
-                    self.execute_with_two_offsets(
+                    self.execute_threadgroups_with_two_offsets(
                         &self.matvec_i4_grouped,
                         (&mapping.buffer, encoded_offset),
                         (&scale_mapping.buffer, scale_offset),
@@ -1059,7 +1059,6 @@ mod implementation {
                             &group_size_buffer,
                         ],
                         rows,
-                        rows.min(REDUCTION_THREADS),
                     )?;
                 }
             }
@@ -1126,7 +1125,7 @@ mod implementation {
                     let scale_columns_buffer =
                         self.buffer_with_data(&[count_u32(scale_columns)?])?;
                     let group_size_buffer = self.buffer_with_data(&[count_u32(group_size)?])?;
-                    self.execute(
+                    self.execute_threadgroups(
                         &self.matvec_i4_grouped,
                         &[
                             &encoded_buffer,
@@ -1138,7 +1137,6 @@ mod implementation {
                             &group_size_buffer,
                         ],
                         rows,
-                        rows.min(REDUCTION_THREADS),
                     )?;
                 }
             }
@@ -1690,6 +1688,100 @@ mod implementation {
                 },
                 MTLSize {
                     width: threadgroup_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::Command(command_buffer.error().map_or_else(
+                    || "unknown command-buffer error".to_owned(),
+                    |error| error.to_string(),
+                )));
+            }
+            Ok(())
+        }
+
+        fn execute_threadgroups(
+            &self,
+            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+            buffers: &[&ProtocolObject<dyn MTLBuffer>],
+            threadgroups: usize,
+        ) -> Result<(), MetalError> {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandEncoding)?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandEncoding)?;
+            encoder.setComputePipelineState(pipeline);
+            for (index, buffer) in buffers.iter().enumerate() {
+                // SAFETY: callers retain every buffer until synchronous
+                // completion, and all bindings use a zero offset.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index) };
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: threadgroups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: REDUCTION_THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::Command(command_buffer.error().map_or_else(
+                    || "unknown command-buffer error".to_owned(),
+                    |error| error.to_string(),
+                )));
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn execute_threadgroups_with_two_offsets(
+            &self,
+            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+            first: (&ProtocolObject<dyn MTLBuffer>, usize),
+            second: (&ProtocolObject<dyn MTLBuffer>, usize),
+            remaining: &[&ProtocolObject<dyn MTLBuffer>],
+            threadgroups: usize,
+        ) -> Result<(), MetalError> {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandEncoding)?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandEncoding)?;
+            encoder.setComputePipelineState(pipeline);
+            // SAFETY: callers range-check both retained mappings and keep all
+            // buffers alive through synchronous completion.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(first.0), first.1, 0);
+                encoder.setBuffer_offset_atIndex(Some(second.0), second.1, 1);
+            }
+            for (index, buffer) in remaining.iter().enumerate() {
+                // SAFETY: every remaining buffer is retained and bound at zero.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index + 2) };
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: threadgroups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: REDUCTION_THREADS,
                     height: 1,
                     depth: 1,
                 },
