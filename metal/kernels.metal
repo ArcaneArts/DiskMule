@@ -354,3 +354,128 @@ kernel void matvec_q6_k(
     }
     output[row] = sum;
 }
+
+kernel void attention_scores(
+    device const float *query [[buffer(0)]],
+    device const float *keys [[buffer(1)]],
+    device float *scores [[buffer(2)]],
+    constant uint &sequence_length [[buffer(3)]],
+    constant uint &cache_width [[buffer(4)]],
+    constant uint &query_heads [[buffer(5)]],
+    constant uint &kv_heads [[buffer(6)]],
+    constant uint &head_dimension [[buffer(7)]],
+    constant uint &start [[buffer(8)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint visible = sequence_length - start;
+    const uint query_head = index / visible;
+    const uint score_index = index % visible;
+    const uint kv_head = query_head / (query_heads / kv_heads);
+    const uint position = start + score_index;
+    const uint query_base = query_head * head_dimension;
+    const uint key_base = position * cache_width + kv_head * head_dimension;
+    float sum = 0.0f;
+    for (uint dimension = 0; dimension < head_dimension; dimension++) {
+        sum = fma(query[query_base + dimension], keys[key_base + dimension], sum);
+    }
+    scores[index] = sum;
+}
+
+kernel void attention_softmax(
+    device float *scores [[buffer(0)]],
+    constant uint &visible [[buffer(1)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint lanes [[threads_per_threadgroup]]) {
+    threadgroup float scratch[256];
+    const uint base = head * visible;
+    float maximum = -INFINITY;
+    for (uint index = lane; index < visible; index += lanes) {
+        maximum = max(maximum, scores[base + index]);
+    }
+    scratch[lane] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lanes / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            scratch[lane] = max(scratch[lane], scratch[lane + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    maximum = scratch[0];
+    float sum = 0.0f;
+    for (uint index = lane; index < visible; index += lanes) {
+        const float probability = exp(scores[base + index] - maximum);
+        scores[base + index] = probability;
+        sum += probability;
+    }
+    scratch[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lanes / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            scratch[lane] += scratch[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_sum = 1.0f / scratch[0];
+    for (uint index = lane; index < visible; index += lanes) {
+        scores[base + index] *= inverse_sum;
+    }
+}
+
+kernel void attention_values(
+    device const float *probabilities [[buffer(0)]],
+    device const float *values [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &visible [[buffer(3)]],
+    constant uint &start [[buffer(4)]],
+    constant uint &cache_width [[buffer(5)]],
+    constant uint &query_heads [[buffer(6)]],
+    constant uint &kv_heads [[buffer(7)]],
+    constant uint &head_dimension [[buffer(8)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint query_head = index / head_dimension;
+    const uint dimension = index % head_dimension;
+    const uint kv_head = query_head / (query_heads / kv_heads);
+    float sum = 0.0f;
+    for (uint score_index = 0; score_index < visible; score_index++) {
+        const uint position = start + score_index;
+        const uint value_index = position * cache_width + kv_head * head_dimension + dimension;
+        sum = fma(values[value_index], probabilities[query_head * visible + score_index], sum);
+    }
+    output[index] = sum;
+}
+
+kernel void top_k_softmax(
+    device const float *logits [[buffer(0)]],
+    device uint *indices [[buffer(1)]],
+    device float *probabilities [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    constant uint &k [[buffer(4)]]) {
+    for (uint selected = 0; selected < k; selected++) {
+        float best_value = -INFINITY;
+        uint best_index = 0xffffffffu;
+        for (uint index = 0; index < count; index++) {
+            bool already_selected = false;
+            for (uint prior = 0; prior < selected; prior++) {
+                already_selected = already_selected || indices[prior] == index;
+            }
+            const float candidate = logits[index];
+            if (!already_selected
+                && (candidate > best_value
+                    || (candidate == best_value && index < best_index))) {
+                best_value = candidate;
+                best_index = index;
+            }
+        }
+        indices[selected] = best_index;
+        probabilities[selected] = best_value;
+    }
+    const float maximum = probabilities[0];
+    float sum = 0.0f;
+    for (uint selected = 0; selected < k; selected++) {
+        probabilities[selected] = exp(probabilities[selected] - maximum);
+        sum += probabilities[selected];
+    }
+    for (uint selected = 0; selected < k; selected++) {
+        probabilities[selected] /= sum;
+    }
+}

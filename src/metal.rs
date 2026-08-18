@@ -93,6 +93,12 @@ pub enum MetalError {
     #[error("matvec output has {actual} rows; expected {expected}")]
     InvalidOutputLength { expected: usize, actual: usize },
 
+    #[error("invalid attention shape: {0}")]
+    InvalidAttentionShape(&'static str),
+
+    #[error("top-k count {k} is outside 1..={length}")]
+    InvalidTopK { k: usize, length: usize },
+
     #[error("could not create a Metal command buffer or compute encoder")]
     CommandEncoding,
 
@@ -135,6 +141,10 @@ mod implementation {
     const MATVEC_Q8_0: &str = "matvec_q8_0";
     const MATVEC_Q4_K: &str = "matvec_q4_k";
     const MATVEC_Q6_K: &str = "matvec_q6_k";
+    const ATTENTION_SCORES: &str = "attention_scores";
+    const ATTENTION_SOFTMAX: &str = "attention_softmax";
+    const ATTENTION_VALUES: &str = "attention_values";
+    const TOP_K_SOFTMAX: &str = "top_k_softmax";
     const REDUCTION_THREADS: usize = 256;
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -157,6 +167,10 @@ mod implementation {
         matvec_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q4_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q6_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        attention_scores: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        attention_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        attention_values: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        top_k_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     impl MetalContext {
@@ -180,6 +194,10 @@ mod implementation {
             let matvec_q8_0 = pipeline(&device, &library, MATVEC_Q8_0)?;
             let matvec_q4_k = pipeline(&device, &library, MATVEC_Q4_K)?;
             let matvec_q6_k = pipeline(&device, &library, MATVEC_Q6_K)?;
+            let attention_scores = pipeline(&device, &library, ATTENTION_SCORES)?;
+            let attention_softmax = pipeline(&device, &library, ATTENTION_SOFTMAX)?;
+            let attention_values = pipeline(&device, &library, ATTENTION_VALUES)?;
+            let top_k_softmax = pipeline(&device, &library, TOP_K_SOFTMAX)?;
             Ok(Self {
                 device,
                 queue,
@@ -196,6 +214,10 @@ mod implementation {
                 matvec_q8_0,
                 matvec_q4_k,
                 matvec_q6_k,
+                attention_scores,
+                attention_softmax,
+                attention_values,
+                top_k_softmax,
             })
         }
 
@@ -493,6 +515,160 @@ mod implementation {
             )?;
             copy_buffer(&output_buffer, output);
             Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attention(
+            &self,
+            query: &[f32],
+            keys: &[f32],
+            values: &[f32],
+            query_heads: usize,
+            kv_heads: usize,
+            head_dimension: usize,
+            window: Option<usize>,
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            if query_heads == 0 || kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+                return Err(MetalError::InvalidAttentionShape(
+                    "query heads must be a non-zero multiple of KV heads",
+                ));
+            }
+            let query_width = query_heads
+                .checked_mul(head_dimension)
+                .ok_or(MetalError::Overflow)?;
+            let cache_width = kv_heads
+                .checked_mul(head_dimension)
+                .ok_or(MetalError::Overflow)?;
+            if query.len() != query_width || output.len() != query_width {
+                return Err(MetalError::InvalidAttentionShape(
+                    "query and output must match query_heads * head_dimension",
+                ));
+            }
+            if cache_width == 0
+                || keys.len() != values.len()
+                || !keys.len().is_multiple_of(cache_width)
+            {
+                return Err(MetalError::InvalidAttentionShape(
+                    "key/value caches must have equal whole-position lengths",
+                ));
+            }
+            let sequence_length = keys.len() / cache_width;
+            if sequence_length == 0 {
+                return Err(MetalError::EmptyInput {
+                    operation: "attention",
+                });
+            }
+            let start = window.map_or(0, |window| sequence_length.saturating_sub(window));
+            let visible = sequence_length - start;
+            if visible == 0 {
+                return Err(MetalError::EmptyInput {
+                    operation: "attention window",
+                });
+            }
+
+            let query_buffer = self.buffer_with_data(query)?;
+            let keys_buffer = self.buffer_with_data(keys)?;
+            let values_buffer = self.buffer_with_data(values)?;
+            let scores_len = query_heads
+                .checked_mul(visible)
+                .ok_or(MetalError::Overflow)?;
+            let scores_buffer = self.empty_buffer::<f32>(scores_len)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let sequence_buffer = self.buffer_with_data(&[count_u32(sequence_length)?])?;
+            let cache_width_buffer = self.buffer_with_data(&[count_u32(cache_width)?])?;
+            let query_heads_buffer = self.buffer_with_data(&[count_u32(query_heads)?])?;
+            let kv_heads_buffer = self.buffer_with_data(&[count_u32(kv_heads)?])?;
+            let head_dimension_buffer = self.buffer_with_data(&[count_u32(head_dimension)?])?;
+            let start_buffer = self.buffer_with_data(&[count_u32(start)?])?;
+            let visible_buffer = self.buffer_with_data(&[count_u32(visible)?])?;
+
+            self.execute(
+                &self.attention_scores,
+                &[
+                    &query_buffer,
+                    &keys_buffer,
+                    &scores_buffer,
+                    &sequence_buffer,
+                    &cache_width_buffer,
+                    &query_heads_buffer,
+                    &kv_heads_buffer,
+                    &head_dimension_buffer,
+                    &start_buffer,
+                ],
+                scores_len,
+                scores_len.min(REDUCTION_THREADS),
+            )?;
+            self.execute(
+                &self.attention_softmax,
+                &[&scores_buffer, &visible_buffer],
+                query_heads
+                    .checked_mul(REDUCTION_THREADS)
+                    .ok_or(MetalError::Overflow)?,
+                REDUCTION_THREADS,
+            )?;
+            self.execute(
+                &self.attention_values,
+                &[
+                    &scores_buffer,
+                    &values_buffer,
+                    &output_buffer,
+                    &visible_buffer,
+                    &start_buffer,
+                    &cache_width_buffer,
+                    &query_heads_buffer,
+                    &kv_heads_buffer,
+                    &head_dimension_buffer,
+                ],
+                output.len(),
+                output.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn top_k_softmax(
+            &self,
+            logits: &[f32],
+            k: usize,
+        ) -> Result<Vec<(usize, f32)>, MetalError> {
+            if k == 0 || k > logits.len() {
+                return Err(MetalError::InvalidTopK {
+                    k,
+                    length: logits.len(),
+                });
+            }
+            if logits.iter().any(|value| !value.is_finite()) {
+                return Err(MetalError::NonFinite {
+                    operation: "top-k softmax",
+                });
+            }
+            let logits_buffer = self.buffer_with_data(logits)?;
+            let indices_buffer = self.empty_buffer::<u32>(k)?;
+            let probabilities_buffer = self.empty_buffer::<f32>(k)?;
+            let count_buffer = self.buffer_with_data(&[count_u32(logits.len())?])?;
+            let k_buffer = self.buffer_with_data(&[count_u32(k)?])?;
+            self.execute(
+                &self.top_k_softmax,
+                &[
+                    &logits_buffer,
+                    &indices_buffer,
+                    &probabilities_buffer,
+                    &count_buffer,
+                    &k_buffer,
+                ],
+                1,
+                1,
+            )?;
+            let mut indices = vec![0_u32; k];
+            let mut probabilities = vec![0.0_f32; k];
+            copy_buffer(&indices_buffer, &mut indices);
+            copy_buffer(&probabilities_buffer, &mut probabilities);
+            Ok(indices
+                .into_iter()
+                .zip(probabilities)
+                .map(|(index, probability)| (index as usize, probability))
+                .collect())
         }
 
         fn execute(
@@ -861,6 +1037,17 @@ mod implementation {
                 context.argmax(&logits).unwrap(),
                 cpu::argmax(&logits).unwrap()
             );
+            let expected_top_k = cpu::top_k_softmax(&logits, 4).unwrap();
+            let actual_top_k = context.top_k_softmax(&logits, 4).unwrap();
+            assert_eq!(
+                actual_top_k.iter().map(|item| item.0).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|item| item.0).collect::<Vec<_>>()
+            );
+            assert_close(
+                &actual_top_k.iter().map(|item| item.1).collect::<Vec<_>>(),
+                &expected_top_k.iter().map(|item| item.1).collect::<Vec<_>>(),
+                2.0e-7,
+            );
         }
 
         #[test]
@@ -887,6 +1074,49 @@ mod implementation {
                     .unwrap();
                 assert_close_relative(&actual, &expected);
             }
+        }
+
+        #[test]
+        fn grouped_sliding_attention_matches_the_cpu_reference() {
+            let context = MetalContext::new().unwrap();
+            let query: [f32; 8] = [1.0, -0.5, 0.25, 0.75, -0.5, 1.0, 0.6, -0.2];
+            let keys: [f32; 12] = [
+                0.5, 0.1, -0.2, 0.8, 0.9, -0.4, 0.3, 0.7, -0.6, 0.2, 1.0, -0.5,
+            ];
+            let values: [f32; 12] = [
+                10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0, -2.0, 0.5, 7.0, -3.0,
+            ];
+            let mut expected = vec![0.0_f32; query.len()];
+            for query_head in 0..4 {
+                let kv_head = query_head / 2;
+                let query_head_values = &query[query_head * 2..query_head * 2 + 2];
+                let mut scores = Vec::new();
+                for position in 1..3 {
+                    let key = &keys[position * 4 + kv_head * 2..position * 4 + kv_head * 2 + 2];
+                    scores.push(
+                        query_head_values
+                            .iter()
+                            .zip(key)
+                            .fold(0.0_f32, |sum, (query, key)| query.mul_add(*key, sum)),
+                    );
+                }
+                cpu::softmax_in_place(&mut scores).unwrap();
+                for (score_index, probability) in scores.into_iter().enumerate() {
+                    let position = score_index + 1;
+                    let value = &values[position * 4 + kv_head * 2..position * 4 + kv_head * 2 + 2];
+                    for (output, value) in expected[query_head * 2..query_head * 2 + 2]
+                        .iter_mut()
+                        .zip(value)
+                    {
+                        *output = value.mul_add(probability, *output);
+                    }
+                }
+            }
+            let mut actual = vec![0.0; query.len()];
+            context
+                .attention(&query, &keys, &values, 4, 2, 2, Some(2), &mut actual)
+                .unwrap();
+            assert_close(&actual, &expected, 2.0e-6);
         }
     }
 }
