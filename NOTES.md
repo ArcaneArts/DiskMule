@@ -42,8 +42,8 @@ Important facts:
 - Apple Silicon lets Metal consume application-owned expert slabs through shared unified-memory buffers, avoiding a discrete-GPU PCIe transfer.
 - Resident dense weights are approximately 9.9 GB at INT4.
 - The routed-expert pool is approximately 370 GB at INT4. An expert is roughly 19 MB, with 19,456 routed experts across the model.
-- The recommended container is grouped INT4/gs64 with an INT8 MTP head, approximately 372 GB. Avoid the older per-row INT4 containers: Colibri reports a material quality regression (roughly nine percentage points in its evaluation).
-- The original FP8 source is approximately 756 GB. The converter is resumable and processes shards without requiring both full FP8 and INT4 copies at once.
+- The recommended container is grouped INT4/gs64 with an INT8 MTP head. The current Hugging Face repository reports 429,276,080,522 bytes total (about 399.8 GiB): 141 ordinary-decode shards occupy 419,296,541,560 bytes (about 390.5 GiB), and the optional MTP shard occupies 9,959,321,520 bytes (about 9.3 GiB). Avoid the older per-row INT4 containers: Colibri reports a material quality regression (roughly nine percentage points in its evaluation).
+- The original FP8 source currently reports 761,025,363,709 bytes (about 709 GiB). The converter is resumable and processes shards without requiring both full FP8 and INT4 copies at once.
 - The Metal source in the inspected revision includes grouped-INT4 handling. Some older performance reports still describe grouped Metal support as unfinished, so trust current source and tests over stale prose.
 - `make metal-test` should be run before model benchmarks. Grouped-INT4 Metal uses a different accumulation order; near-tie logits may diverge even when numerical error is small.
 - Published Metal results vary significantly by cache state, SSD, flags, and model format. An M4 Max 128 GB result in `docs/metal.md` reports about 0.42 tok/s, while a tuned M5 Max 128 GB report reaches about 2.24 tok/s. Do not transfer a headline number across machines without reproducing its exact conditions.
@@ -165,18 +165,37 @@ safetensors metadata. Deterministic fixtures cover the complete ordinary-decode
 graph: native byte-level BPE and chat framing, MLA compressed KV, the GLM
 adjacent-pair-to-contiguous-halves RoPE layout, full and shared DSA, router
 correction bias, normalized top-k routed experts, shared experts, and residual
-ordering. CPU readers support F32, F16, BF16, and 128-by-128 block-scaled
-E4M3FN. The tiny fixture predicts `5, 9, 10, 5`; its final logit zero is
-approximately `-0.12922081`.
+ordering. CPU readers support F32, F16, BF16, 128-by-128 block-scaled E4M3FN,
+flat row-INT8, and packed grouped-INT4 with F32 `.qs` scales. The integer
+layouts match Colibri's low-nibble-even convention and scale geometry; logical
+shapes come from the GLM tensor contract rather than the intentionally
+flattened U8 storage shape. The original F32 tiny fixture predicts
+`5, 9, 10, 5`; its final logit zero is approximately `-0.12922081`. A tiny
+graph with every eligible matrix quantized matches a separately dequantized F32
+oracle within `1e-6`.
+
+The recommended repository's 141 headers were also audited remotely without
+downloading payloads. They contain 116,915 unique entries, no duplicates, and
+all 58,689 required ordinary-decode tensors: 463 F32, two row-INT8, and 58,224
+grouped-INT4/gs64 matrices. They contain no DSA indexer tensors. This is
+intentional in Colibri: the optional separately converted indexer sidecar
+enables sparse DSA beyond `index_topk`, while its absence keeps exact dense
+attention. DiskMule accepts only the complete sidecar or none of it, rejecting
+partial indexer state that could otherwise change long-context behavior
+silently.
 
 On Metal, dense tensors remain in retained no-copy whole-shard mappings.
 Safetensors payload offsets are not assumed to be naturally aligned: F32, F16,
 and BF16 kernels reconstruct little-endian values from bytes, avoiding silent
-misreads observed with typed loads from an unaligned fixture. Routed experts
-remain governed by the explicit per-layer bounded LRU. On a miss, exact encoded
-gate/up/down ranges and any FP8 scales are read in bounded parallel; cached
-matrices and SiLU gating then execute through Metal. Tiny full-graph CPU and
-Metal logits and DSA selections match within `1e-4`.
+misreads observed with typed loads from an unaligned fixture. Dedicated
+row-INT8 and grouped-INT4 kernels consume mapped `.qs` scales without expanding
+weights. Owned and mapped operator tests include deliberately nonzero,
+unaligned tensor and scale offsets. Routed experts remain governed by the
+explicit per-layer bounded LRU. On a miss, exact encoded gate/up/down ranges
+and their FP8 or integer scales are read in bounded parallel; cached matrices
+and SiLU gating then execute through Metal. Tiny full-graph CPU and Metal
+logits and DSA selections, including integer streamed experts, match within
+`1e-4`.
 
 GLM generation uses the same runtime, sampling, CLI, HTTP workers, sessions,
 prefix reuse, cancellation, and bounded queues as Gemma. Its profile reports
@@ -187,10 +206,14 @@ descriptor on macOS for a controlled direct-versus-buffered experiment. No
 performance conclusion has been drawn from the tiny fixture.
 
 This closes safe implementation work but not Phase 6. There is no full GLM-5.2
-checkpoint in the local model stores, and the required source or converted
-container is hundreds of gigabytes. Full out-of-core correctness, cache-budget
-sweeps, memory-pressure measurements, and reproducible performance logs require
-an explicitly authorized model acquisition and storage commitment.
+checkpoint in the local model stores. The official FP8 repository is about 709
+GiB. The recommended grouped-INT4 repository is about 399.8 GiB total;
+excluding the unneeded first-pass MTP shard still requires about 390.5 GiB.
+With 474 GiB currently free, using the internal volume would leave only about
+83 GiB and is not a safe implicit action. Full out-of-core correctness,
+cache-budget sweeps, memory-pressure measurements, and reproducible performance
+logs require an explicitly authorized acquisition target and storage
+commitment.
 
 ## DiskMule Qwen3.5/Qwen3.8 findings
 

@@ -342,6 +342,7 @@ pub struct Glm52Weights {
     pub output: usize,
     pub output_norm: usize,
     pub layers: Vec<Glm52LayerWeights>,
+    pub dsa_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +401,7 @@ impl Glm52Weights {
             required_matrix(index, "model.embed_tokens.weight", &[vocab, hidden])?;
         let output = required_matrix(index, "lm_head.weight", &[vocab, hidden])?;
         let output_norm = required_vector(index, "model.norm.weight", hidden)?;
+        let dsa_enabled = indexer_availability(index, config)?;
         let mut layers = Vec::with_capacity(config.layer_count);
         for layer in 0..config.layer_count {
             let prefix = format!("model.layers.{layer}");
@@ -522,7 +524,7 @@ impl Glm52Weights {
                     experts,
                 }
             };
-            let indexer = (config.indexer_kinds[layer] == IndexerKind::Full)
+            let indexer = (dsa_enabled && config.indexer_kinds[layer] == IndexerKind::Full)
                 .then(|| {
                     Ok::<_, Glm52Error>(Glm52IndexerWeights {
                         query: required_matrix(
@@ -575,8 +577,42 @@ impl Glm52Weights {
             output,
             output_norm,
             layers,
+            dsa_enabled,
         })
     }
+}
+
+fn indexer_availability(index: &SafeTensorIndex, config: &Glm52Config) -> Result<bool, Glm52Error> {
+    let mut required = Vec::new();
+    for (layer, kind) in config.indexer_kinds.iter().enumerate() {
+        if *kind != IndexerKind::Full {
+            continue;
+        }
+        let prefix = format!("model.layers.{layer}.self_attn.indexer");
+        for suffix in [
+            "wq_b.weight",
+            "wk.weight",
+            "weights_proj.weight",
+            "k_norm.weight",
+            "k_norm.bias",
+        ] {
+            required.push(format!("{prefix}.{suffix}"));
+        }
+    }
+    let present = required
+        .iter()
+        .filter(|name| index.tensor(name).is_some())
+        .count();
+    if present == 0 {
+        return Ok(false);
+    }
+    if let Some(missing) = required
+        .into_iter()
+        .find(|name| index.tensor(name).is_none())
+    {
+        return Err(Glm52Error::MissingTensor(missing));
+    }
+    Ok(true)
 }
 
 fn required_vector(index: &SafeTensorIndex, name: &str, length: u64) -> Result<usize, Glm52Error> {
@@ -884,6 +920,7 @@ mod tests {
             crate::safetensors::SafeDtype::F8E4M3
         );
         assert_eq!(weights.layers.len(), 2);
+        assert!(weights.dsa_enabled);
         assert!(weights.layers[0].indexer.is_some());
         assert!(weights.layers[1].indexer.is_none());
         assert!(matches!(

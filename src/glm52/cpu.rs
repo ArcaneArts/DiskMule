@@ -198,6 +198,9 @@ impl Glm52CpuModel {
         }
         let source = SafeTensorSource::open_with_cache_policy(directory, glm_read_cache_policy()?)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
+        if !weights.dsa_enabled {
+            tracing::warn!("GLM snapshot has no DSA indexer sidecar; using exact dense attention");
+        }
         let expert_cache = Glm52ExpertCache::new(source.clone(), &weights, expert_cache_slots()?)?;
         #[cfg(target_os = "macos")]
         let metal = use_metal
@@ -573,12 +576,8 @@ impl Glm52CpuModel {
         cache.latent.push(latent);
         cache.rope.push(rope);
 
-        match config.indexer_kinds[layer_index] {
-            IndexerKind::Full => {
-                let indexer = weights
-                    .indexer
-                    .as_ref()
-                    .expect("validated full DSA layer has indexer weights");
+        match (config.indexer_kinds[layer_index], weights.indexer.as_ref()) {
+            (IndexerKind::Full, Some(indexer)) => {
                 let key = self.index_key(reader, indexer, hidden, position)?;
                 cache.index_keys.push(key);
                 session.dsa_selection = self.index_selection(
@@ -591,12 +590,15 @@ impl Glm52CpuModel {
                     cancelled,
                 )?;
             }
-            IndexerKind::Shared if position + 1 > config.index_topk => {
+            (IndexerKind::Full, None) => session.dsa_selection = None,
+            (IndexerKind::Shared, _)
+                if self.weights.dsa_enabled && position + 1 > config.index_topk =>
+            {
                 if session.dsa_selection.is_none() {
                     return Err(Glm52CpuError::MissingDsaSelection { layer: layer_index });
                 }
             }
-            IndexerKind::Shared => {}
+            (IndexerKind::Shared, _) => {}
         }
 
         let positions = session
@@ -1463,7 +1465,8 @@ mod tests {
     use crate::safetensors::SafeTensorSource;
 
     use super::{
-        Glm52CpuError, Glm52CpuModel, TensorReader, decode_f8_e4m3fn, rope_interleaved_prefix,
+        Glm52CpuError, Glm52CpuModel, Glm52Error, TensorReader, decode_f8_e4m3fn,
+        rope_interleaved_prefix,
     };
 
     #[test]
@@ -1579,6 +1582,8 @@ mod tests {
                     vec![0x40, 0xc8, 0x0f, 0xa9, 0xcb, 0x0d],
                 ),
                 ("int4.qs", "F32", vec![2], int4_scales),
+                ("e8", "U8", vec![196], vec![0_u8; 196]),
+                ("e8.qs", "F32", vec![1], 6.0_f32.to_le_bytes().to_vec()),
             ],
         );
         let source = SafeTensorSource::open(temp.path()).unwrap();
@@ -1601,6 +1606,11 @@ mod tests {
         let mut int4_row = [0.0; 5];
         reader.matrix_row_into(int4, 0, &mut int4_row).unwrap();
         assert_eq!(int4_row, [-4.0, -2.0, 0.0, 2.0, 3.5]);
+
+        assert!(matches!(
+            reader.matvec(tensor_index(&source, "e8"), &vec![1.0; 256]),
+            Err(Glm52CpuError::Quantization(_))
+        ));
     }
 
     #[test]
@@ -1680,6 +1690,40 @@ mod tests {
         let stats = quantized.expert_cache_stats().unwrap();
         assert!(stats.misses > 0);
         assert!(stats.bytes_read > 0);
+    }
+
+    #[test]
+    fn absent_dsa_sidecar_uses_dense_attention_but_partial_sidecar_is_rejected() {
+        let dense_directory = TempDir::new().unwrap();
+        write_tiny_model(dense_directory.path());
+        rewrite_without_tensors(dense_directory.path(), |name| name.contains(".indexer."));
+        let dense = Glm52CpuModel::from_directory(dense_directory.path()).unwrap();
+        assert!(!dense.weights.dsa_enabled);
+        let cancelled = AtomicBool::new(false);
+        let mut session = dense.start_session(8);
+        for token in [1, 2, 3, 4] {
+            dense
+                .forward_token(&mut session, token, &cancelled)
+                .unwrap();
+        }
+        assert!(session.dsa_selection.is_none());
+        assert!(
+            session
+                .layers
+                .iter()
+                .all(|layer| layer.index_keys.is_empty())
+        );
+
+        let partial_directory = TempDir::new().unwrap();
+        write_tiny_model(partial_directory.path());
+        rewrite_without_tensors(partial_directory.path(), |name| {
+            name == "model.layers.0.self_attn.indexer.wk.weight"
+        });
+        assert!(matches!(
+            Glm52CpuModel::from_directory(partial_directory.path()),
+            Err(Glm52CpuError::Model(Glm52Error::MissingTensor(name)))
+                if name == "model.layers.0.self_attn.indexer.wk.weight"
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -2086,6 +2130,26 @@ mod tests {
         drop(source);
         write_owned_safetensors(&quantized_directory.join("model.safetensors"), &quantized);
         write_owned_safetensors(&reference_directory.join("model.safetensors"), &reference);
+    }
+
+    fn rewrite_without_tensors(directory: &Path, remove: impl Fn(&str) -> bool) {
+        let source = SafeTensorSource::open(directory).unwrap();
+        let mut retained = Vec::new();
+        for tensor in source.index.tensors() {
+            if remove(&tensor.name) {
+                continue;
+            }
+            let mut bytes = vec![0_u8; tensor.byte_len as usize];
+            source.read_tensor_at(&tensor.name, 0, &mut bytes).unwrap();
+            let dtype = match tensor.dtype {
+                crate::safetensors::SafeDtype::F32 => "F32",
+                crate::safetensors::SafeDtype::U8 => "U8",
+                dtype => panic!("unexpected tiny-fixture dtype {dtype:?}"),
+            };
+            retained.push((tensor.name.clone(), dtype, tensor.shape.clone(), bytes));
+        }
+        drop(source);
+        write_owned_safetensors(&directory.join("model.safetensors"), &retained);
     }
 
     fn quantize_rows(

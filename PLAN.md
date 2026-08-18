@@ -284,9 +284,10 @@ shutdown. CLI and both server modes produced the same configured greedy
 
 ### Phase 6: GLM-5.2 and genuine out-of-core operation
 
-Status: implementation complete for deterministic tiny CPU/Metal fixtures;
-full-model validation and performance sweeps remain blocked on an authorized
-GLM-5.2 checkpoint acquisition.
+Status: safe implementation complete for deterministic tiny CPU/Metal fixtures,
+including the recommended Colibri grouped-INT4 container; full-model validation
+and performance sweeps remain blocked on an authorized GLM-5.2 checkpoint
+acquisition with adequate storage headroom.
 
 - Add safetensors indexing and the GLM-5.2 architecture module.
 - Port only the GLM-specific semantics required for correct inference, using
@@ -303,15 +304,45 @@ the configuration and complete tensor contract without loading payloads. The
 architecture module implements tokenizer/chat framing, MLA compressed KV,
 full/shared DSA, adjacent-pair RoPE semantics, dense and MoE SwiGLU, correction
 bias routing, shared experts, residual ordering, stops, prefix reuse, and
-cancellation. CPU supports F32/F16/BF16/block-scaled FP8. On macOS, sharded
-dense tensors execute from retained no-copy Metal mappings and selected routed
-experts execute through Metal after bounded parallel reads into an explicit
-per-layer LRU. CPU/Metal tiny-model logits, DSA choices, and greedy tokens
-match. Profiles expose phase timing, logical tensor bytes, resident generation
-state, expert residency, reads, bytes, cache events, and I/O wait. Buffered
-expert reads are the default and `DISKMULE_GLM_DIRECT=1` enables macOS
-`F_NOCACHE` for controlled comparison. This is necessary fixture evidence, not
-the exit criterion's required full-model evidence.
+cancellation. CPU supports F32/F16/BF16/block-scaled FP8 plus the flat-U8
+row-INT8 and grouped-INT4 layouts used by Colibri (`.qs` F32 scales, including
+gs64). The loader derives and strictly validates logical matrix geometry from
+the expected GLM tensor contract, packed bytes, and scale cardinality. On
+macOS, sharded dense tensors execute from retained no-copy Metal mappings and
+selected routed experts execute through Metal after bounded parallel reads
+into an explicit per-layer LRU. Owned and mapped Metal fixtures cover nonzero,
+unaligned payload offsets. A tiny graph with every eligible matrix quantized
+matches its separately dequantized F32 CPU oracle within `1e-6`; CPU/Metal
+logits and greedy choices, including cache-resident routed experts, match
+within `1e-4`. Profiles
+expose phase timing, logical tensor bytes, resident generation state, expert
+residency, reads, bytes, cache events, and I/O wait. Buffered expert reads are
+the default and `DISKMULE_GLM_DIRECT=1` enables macOS `F_NOCACHE` for controlled
+comparison. This is necessary fixture evidence, not the exit criterion's
+required full-model evidence.
+
+A read-only HTTP range audit of all 141 recommended-checkpoint headers found
+116,915 unique entries and no duplicates. Every one of DiskMule's 58,689
+ordinary-decode tensors is present with the expected logical geometry: 463 F32,
+two row-INT8, and 58,224 grouped-INT4/gs64 matrices. The repository intentionally
+contains no DSA indexer tensors. DiskMule therefore treats the indexer sidecar as
+strictly all-or-none: a completely absent sidecar uses exact dense attention,
+matching Colibri's behavior, while a partial sidecar is rejected.
+
+Acquisition audit on 2026-08-18: the official `zai-org/GLM-5.2-FP8` repository
+reports `761,025,363,709` bytes (about 709 GiB), which cannot fit in the current
+474 GiB of free space. The recommended
+`mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp` repository reports
+`429,276,080,522` bytes (about 399.8 GiB). Ordinary decode needs its 141 main
+safetensors shards, `419,296,541,560` bytes (about 390.5 GiB), plus small
+configuration/tokenizer files; the optional MTP shard adds `9,959,321,520`
+bytes (about 9.3 GiB) and is not part of the first validation. Even a selective
+main-model acquisition would leave only about 83 GiB free on the current
+volume, while the whole repository would leave about 74 GiB and take the
+volume to roughly 98% utilization. DiskMule will not make that commitment
+without explicit authorization or a suitably sized external target. The exact
+acquisition and validation sequence is retained in
+`benchmarks/2026-08-18-glm52-acquisition-plan.md`.
 
 ### Phase 7: broaden model support
 
@@ -366,7 +397,8 @@ the real graph and CLI/server worker paths.
 
 ## Current milestone
 
-All safe Phase 6 implementation work and Phase 7 are complete. The remaining
+All safe Phase 6 implementation work, including Colibri grouped-INT4 CPU,
+Metal, and streamed-expert execution, and Phase 7 are complete. The remaining
 goal blocker is the unavailable full GLM-5.2 checkpoint and the authorization
 required for its hundreds-of-gigabytes storage commitment, out-of-core oracle,
 and controlled performance sweep. These commands work:

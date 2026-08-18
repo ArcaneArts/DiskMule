@@ -208,11 +208,18 @@ The safetensors reader validates single-file or indexed sharded snapshots
 without loading tensor payloads. The GLM-5.2 module owns tokenizer/chat framing,
 MLA compressed KV state, full/shared DSA selection history, RoPE, routing,
 shared and streamed experts, residual order, and stop tokens. CPU execution
-supports F32, F16, BF16, and block-scaled FP8; Metal dispatches the same dense
-and cached-expert encodings. Generation profiles include logical tensor bytes,
-resident KV/DSA bytes, cache reads/hits/misses/evictions/I/O wait, and phase
-timings. Tiny deterministic fixtures prove CPU/Metal parity but are not treated
-as full GLM evidence.
+supports F32, F16, BF16, block-scaled FP8, and the flat row-INT8 and packed
+grouped-INT4 plus `.qs` layouts used by the recommended Colibri checkpoint.
+Metal dispatches the same dense and cached-expert encodings directly from shard
+mappings or bounded resident slots. Generation profiles include logical tensor
+bytes, resident KV/DSA bytes, cache reads/hits/misses/evictions/I/O wait, and
+phase timings. Tiny deterministic fixtures prove CPU/dequantized and CPU/Metal
+parity but are not treated as full GLM evidence.
+
+DSA indexer weights are an optional all-or-none sidecar. A snapshot without
+them uses exact dense attention; a partial sidecar is rejected. This permits the
+recommended grouped-INT4 checkpoint, which intentionally omits indexer weights,
+without pretending sparse long-context selection is active.
 
 On macOS, the Metal backend implements the same encodings and Gemma operations
 with a retained no-copy view of the GGUF mapping. Its KV cache is resident and
