@@ -203,17 +203,18 @@ fn installed_gemma_is_listed_inspected_and_protected() {
         .expect("gemma4:26b should be listed");
     assert!(gemma.contains("\tgemma4\tQ4_K_M\t"));
     assert!(gemma.contains("\tollama (read-only)\t"));
-    assert!(gemma.contains("metadata-compatible; inference pending"));
+    assert!(gemma.contains("metadata-compatible"));
 
     let run = diskmule(isolated_home.path(), ["run", "gemma4:26b"]);
-    assert_eq!(run.status.code(), Some(1));
+    assert!(run.status.success(), "run failed: {}", stderr(&run));
     let inspection = String::from_utf8_lossy(&run.stdout);
     assert!(inspection.contains("Model: gemma4:26b"));
     assert!(inspection.contains("Source: ollama (read-only)"));
     assert!(inspection.contains("Architecture: gemma4"));
     assert!(inspection.contains("Quantization: Q4_K_M"));
     assert!(inspection.contains("GGUF version: 3"));
-    assert!(stderr(&run).contains("model inference is not implemented yet"));
+    assert!(inspection.contains("DiskMule CPU chat"));
+    assert!(inspection.ends_with(">>> "));
 
     let remove = diskmule(isolated_home.path(), ["rm", "gemma4:26b"]);
     assert_eq!(remove.status.code(), Some(1));

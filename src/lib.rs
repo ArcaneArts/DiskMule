@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod cli;
 pub mod config;
 pub mod cpu;
@@ -7,7 +8,7 @@ pub mod gguf;
 pub mod model;
 pub mod server;
 
-use std::io::Write;
+use std::io::{self, BufRead, Write};
 
 use cli::{Action, Cli};
 use config::Paths;
@@ -19,6 +20,16 @@ use model::{ModelCatalog, format_size};
 /// Keeping dispatch in the library lets command behavior be tested without
 /// spawning a subprocess.
 pub async fn execute(cli: &Cli, paths: &Paths, output: &mut impl Write) -> Result<()> {
+    execute_with_io(cli, paths, &mut io::stdin().lock(), output).await
+}
+
+/// Runs one parsed command with injectable terminal I/O.
+pub async fn execute_with_io(
+    cli: &Cli,
+    paths: &Paths,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
     match cli.action()? {
         Action::Serve => server::serve(server::DEFAULT_BIND, server::shutdown_signal()).await?,
         Action::Run { model } => {
@@ -58,10 +69,13 @@ pub async fn execute(cli: &Cli, paths: &Paths, output: &mut impl Write) -> Resul
                 }
                 .into());
             }
-            return Err(AppError::NotImplementedWithContext {
-                operation: "model inference",
-                context: record.name,
-            });
+            let path = record.path.as_deref().ok_or_else(|| {
+                AppError::InvalidConfiguration(format!(
+                    "model {:?} has no local tensor path",
+                    record.name
+                ))
+            })?;
+            chat::run_gemma4_cpu(path, input, output)?;
         }
         Action::List => {
             let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;

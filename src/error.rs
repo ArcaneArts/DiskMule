@@ -31,6 +31,9 @@ pub enum AppError {
 
     #[error(transparent)]
     Server(#[from] crate::server::ServerError),
+
+    #[error(transparent)]
+    Gemma4(#[from] crate::gemma4::cpu::RuntimeError),
 }
 
 impl AppError {
@@ -45,6 +48,7 @@ impl AppError {
             Self::Gguf(_) => ExitCode::FAILURE,
             Self::Model(_) => ExitCode::FAILURE,
             Self::Server(_) => ExitCode::FAILURE,
+            Self::Gemma4(_) => ExitCode::FAILURE,
         }
     }
 }

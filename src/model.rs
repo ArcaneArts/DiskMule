@@ -96,9 +96,7 @@ impl Compatibility {
 impl fmt::Display for Compatibility {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MetadataCompatible => {
-                formatter.write_str("metadata-compatible; inference pending")
-            }
+            Self::MetadataCompatible => formatter.write_str("metadata-compatible"),
             Self::Unsupported(reason) => write!(formatter, "unsupported: {reason}"),
             Self::Invalid(reason) => write!(formatter, "invalid: {reason}"),
         }
