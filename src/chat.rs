@@ -1,7 +1,6 @@
 //! Interactive terminal chat backed by the shared Gemma generation engine.
 
 use std::{
-    env,
     io::{BufRead, Write},
     path::Path,
 };
@@ -9,14 +8,119 @@ use std::{
 use crate::{
     error::{AppError, Result},
     gemma4::{ChatMessage, ChatRole, cpu::CancellationFlag},
-    runtime::{BackendSelection, GenerationEngine, GenerationOptions},
+    runtime::{
+        BackendSelection, GenerationEngine, GenerationEvent, GenerationOptions, RuntimeService,
+    },
 };
 
 const DEFAULT_CONTEXT: usize = 4_096;
 const DEFAULT_MAXIMUM_NEW_TOKENS: usize = 64;
 
-pub fn run_gemma4(path: &Path, input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
-    run_gemma4_with_backend(path, input, output, BackendSelection::from_environment()?)
+pub async fn run_model(
+    model: &str,
+    runtime: RuntimeService,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    let options = GenerationOptions::from_environment()?;
+    writeln!(
+        output,
+        "DiskMule {} chat. Enter /clear to reset or /bye to exit.",
+        runtime.backend().label()
+    )?;
+    if options.sampling.temperature == 0.0 {
+        writeln!(output, "Sampling: deterministic greedy")?;
+    } else {
+        writeln!(
+            output,
+            "Sampling: temperature {}, top-k {}, top-p {}, seed {}",
+            options.sampling.temperature,
+            options.sampling.top_k,
+            options.sampling.top_p,
+            options.sampling.seed
+        )?;
+    }
+    let mut history = Vec::new();
+    let mut line = String::new();
+    let mut loading_announced = false;
+    loop {
+        write!(output, ">>> ")?;
+        output.flush()?;
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            break;
+        }
+        let prompt = line.trim();
+        match prompt {
+            "" => continue,
+            "/bye" | "/exit" | "/quit" => break,
+            "/clear" => {
+                history.clear();
+                writeln!(output, "Conversation cleared.")?;
+                continue;
+            }
+            "/help" => {
+                writeln!(output, "Commands: /clear, /bye, /exit, /quit, /help")?;
+                continue;
+            }
+            _ => {}
+        }
+
+        if !loading_announced {
+            writeln!(output, "Loading model...")?;
+            output.flush()?;
+            loading_announced = true;
+        }
+        history.push(ChatMessage::new(ChatRole::User, prompt));
+        let mut ticket = runtime.generate(model, history.clone(), options)?;
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        let mut completed_text = None;
+        let mut cancelled = false;
+        loop {
+            tokio::select! {
+                signal = &mut interrupt => {
+                    ticket.cancel();
+                    cancelled = true;
+                    match signal {
+                        Ok(()) => writeln!(output, "\nGeneration cancelled.")?,
+                        Err(error) => return Err(error.into()),
+                    }
+                    break;
+                }
+                event = ticket.recv() => match event {
+                    Some(GenerationEvent::Token { text, .. }) => {
+                        write!(output, "{text}")?;
+                        output.flush()?;
+                    }
+                    Some(GenerationEvent::Complete(result)) => {
+                        completed_text = Some(result.text.trim().to_owned());
+                        writeln!(output)?;
+                        break;
+                    }
+                    Some(GenerationEvent::Error { message, cancelled: true }) => {
+                        cancelled = true;
+                        writeln!(output, "\nGeneration cancelled: {message}")?;
+                        break;
+                    }
+                    Some(GenerationEvent::Error { message, cancelled: false }) => {
+                        return Err(AppError::GenerationFailed(message));
+                    }
+                    None => {
+                        return Err(AppError::GenerationFailed(
+                            "generation worker closed without a final response".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        if cancelled {
+            history.pop();
+        } else if let Some(text) = completed_text {
+            history.push(ChatMessage::new(ChatRole::Assistant, text));
+        }
+    }
+    Ok(())
 }
 
 pub fn run_gemma4_cpu(
@@ -39,9 +143,8 @@ fn run_gemma4_with_backend(
         backend.label()
     )?;
     let mut engine = None;
-    let context = bounded_environment("DISKMULE_CONTEXT", DEFAULT_CONTEXT, 1, 262_144)?;
-    let maximum_new_tokens =
-        bounded_environment("DISKMULE_MAX_TOKENS", DEFAULT_MAXIMUM_NEW_TOKENS, 1, 4_096)?;
+    let context = DEFAULT_CONTEXT;
+    let maximum_new_tokens = DEFAULT_MAXIMUM_NEW_TOKENS;
     let mut history = Vec::new();
     let mut line = String::new();
     loop {
@@ -102,27 +205,6 @@ fn run_gemma4_with_backend(
         history.push(ChatMessage::new(ChatRole::Assistant, generated.text.trim()));
     }
     Ok(())
-}
-
-fn bounded_environment(
-    name: &'static str,
-    default: usize,
-    minimum: usize,
-    maximum: usize,
-) -> Result<usize> {
-    let Some(raw) = env::var_os(name) else {
-        return Ok(default);
-    };
-    let value = raw
-        .to_str()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (minimum..=maximum).contains(value))
-        .ok_or_else(|| {
-            AppError::InvalidConfiguration(format!(
-                "{name} must be an integer in {minimum}..={maximum}"
-            ))
-        })?;
-    Ok(value)
 }
 
 #[cfg(test)]

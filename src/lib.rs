@@ -51,7 +51,8 @@ pub async fn execute_with_io(
             .await?;
         }
         Action::Run { model } => {
-            let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;
+            let ollama_root = config::ollama_models_dir()?;
+            let catalog = ModelCatalog::discover(paths, ollama_root.clone())?;
             let record = catalog.resolve_for_run(model)?;
             writeln!(output, "Model: {}", record.name)?;
             writeln!(output, "Source: {}", record.source)?;
@@ -87,13 +88,19 @@ pub async fn execute_with_io(
                 }
                 .into());
             }
-            let path = record.path.as_deref().ok_or_else(|| {
-                AppError::InvalidConfiguration(format!(
+            if record.path.is_none() {
+                return Err(AppError::InvalidConfiguration(format!(
                     "model {:?} has no local tensor path",
                     record.name
-                ))
-            })?;
-            chat::run_gemma4(path, input, output)?;
+                )));
+            }
+            let runtime = RuntimeService::new(
+                paths.clone(),
+                ollama_root,
+                BackendSelection::from_environment()?,
+                RuntimeLimits::from_environment()?,
+            )?;
+            chat::run_model(model, runtime, input, output).await?;
         }
         Action::List => {
             let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;

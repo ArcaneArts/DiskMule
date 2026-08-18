@@ -257,6 +257,32 @@ impl Default for GenerationOptions {
 }
 
 impl GenerationOptions {
+    pub fn from_environment() -> Result<Self, RuntimeError> {
+        Self {
+            maximum_new_tokens: runtime_usize_environment(
+                "DISKMULE_MAX_TOKENS",
+                DEFAULT_MAXIMUM_NEW_TOKENS,
+                1,
+                4_096,
+            )?,
+            sampling: SamplingConfig {
+                temperature: runtime_f32_environment(
+                    "DISKMULE_TEMPERATURE",
+                    SamplingConfig::default().temperature,
+                )?,
+                top_k: runtime_usize_environment(
+                    "DISKMULE_TOP_K",
+                    SamplingConfig::default().top_k,
+                    0,
+                    1_000_000,
+                )?,
+                top_p: runtime_f32_environment("DISKMULE_TOP_P", SamplingConfig::default().top_p)?,
+                seed: runtime_u64_environment("DISKMULE_SEED", SamplingConfig::default().seed)?,
+            },
+        }
+        .validate()
+    }
+
     pub fn validate(self) -> Result<Self, RuntimeError> {
         if !(1..=4_096).contains(&self.maximum_new_tokens) {
             return Err(RuntimeError::InvalidConfiguration(
@@ -474,6 +500,10 @@ impl RuntimeService {
         self.inner.limits
     }
 
+    pub fn backend(&self) -> BackendSelection {
+        self.inner.backend
+    }
+
     pub fn loaded_models(&self) -> Vec<LoadedModelInfo> {
         let workers = lock_unpoisoned(&self.inner.workers);
         let mut models = workers
@@ -684,6 +714,47 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn runtime_usize_environment(
+    name: &'static str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, RuntimeError> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    raw.to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (minimum..=maximum).contains(value))
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfiguration(format!(
+                "{name} must be an integer in {minimum}..={maximum}"
+            ))
+        })
+}
+
+fn runtime_f32_environment(name: &'static str, default: f32) -> Result<f32, RuntimeError> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    raw.to_str()
+        .and_then(|value| value.parse::<f32>().ok())
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfiguration(format!("{name} must be a floating-point number"))
+        })
+}
+
+fn runtime_u64_environment(name: &'static str, default: u64) -> Result<u64, RuntimeError> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    raw.to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfiguration(format!("{name} must be an unsigned integer"))
+        })
 }
 
 struct Sampler {
