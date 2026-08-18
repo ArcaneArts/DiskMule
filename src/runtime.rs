@@ -1,16 +1,24 @@
 //! Shared model loading, prompt rendering, sampling, and token generation.
 
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, mpsc},
+    thread,
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc as async_mpsc;
 
-use crate::gemma4::{
-    ChatMessage, Gemma4Tokenizer,
-    cpu::{CancellationFlag, Gemma4CpuModel, GenerationResult, RuntimeError},
-    render_chat,
+use crate::{
+    config::Paths,
+    gemma4::{
+        ChatMessage, Gemma4Tokenizer,
+        cpu::{CancellationFlag, Gemma4CpuModel, GenerationResult, RuntimeError},
+        render_chat,
+    },
+    model::{ModelCatalog, ModelError},
 };
 
 #[cfg(target_os = "macos")]
@@ -18,6 +26,81 @@ use crate::gemma4::metal::{ExpertResidency, Gemma4MetalModel};
 
 pub const DEFAULT_CONTEXT: usize = 4_096;
 pub const DEFAULT_MAXIMUM_NEW_TOKENS: usize = 64;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Model(#[from] ModelError),
+
+    #[error("model {name:?} has no local tensor path")]
+    MissingModelPath { name: String },
+
+    #[error("model {name:?} uses unsupported architecture {architecture:?}")]
+    UnsupportedArchitecture { name: String, architecture: String },
+
+    #[error("loaded-model limit of {limit} has been reached")]
+    ModelLimit { limit: usize },
+
+    #[error("request queue for model {model:?} is full")]
+    QueueFull { model: String },
+
+    #[error("generation worker for model {model:?} stopped unexpectedly")]
+    WorkerStopped { model: String },
+
+    #[error("could not start generation worker for model {model:?}: {source}")]
+    SpawnWorker {
+        model: String,
+        source: std::io::Error,
+    },
+
+    #[error("invalid runtime limits: {0}")]
+    InvalidLimits(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeLimits {
+    pub context: usize,
+    pub maximum_loaded_models: usize,
+    pub request_queue: usize,
+    pub token_buffer: usize,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            context: DEFAULT_CONTEXT,
+            maximum_loaded_models: 1,
+            request_queue: 8,
+            token_buffer: 32,
+        }
+    }
+}
+
+impl RuntimeLimits {
+    pub fn validate(self) -> Result<Self, ServiceError> {
+        if !(1..=262_144).contains(&self.context) {
+            return Err(ServiceError::InvalidLimits(
+                "context must be in 1..=262144".to_owned(),
+            ));
+        }
+        if !(1..=16).contains(&self.maximum_loaded_models) {
+            return Err(ServiceError::InvalidLimits(
+                "maximum_loaded_models must be in 1..=16".to_owned(),
+            ));
+        }
+        if !(1..=1_024).contains(&self.request_queue) {
+            return Err(ServiceError::InvalidLimits(
+                "request_queue must be in 1..=1024".to_owned(),
+            ));
+        }
+        if !(1..=4_096).contains(&self.token_buffer) {
+            return Err(ServiceError::InvalidLimits(
+                "token_buffer must be in 1..=4096".to_owned(),
+            ));
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendSelection {
@@ -259,6 +342,292 @@ impl GenerationEngine {
     }
 }
 
+#[derive(Clone)]
+pub struct RuntimeService {
+    inner: Arc<RuntimeServiceInner>,
+}
+
+struct RuntimeServiceInner {
+    paths: Paths,
+    ollama_root: Option<PathBuf>,
+    backend: BackendSelection,
+    limits: RuntimeLimits,
+    workers: Mutex<HashMap<PathBuf, ModelWorker>>,
+}
+
+struct ModelWorker {
+    name: String,
+    architecture: String,
+    backend: String,
+    sender: mpsc::SyncSender<GenerationJob>,
+    status: Arc<Mutex<WorkerStatus>>,
+}
+
+struct GenerationJob {
+    messages: Vec<ChatMessage>,
+    options: GenerationOptions,
+    cancellation: CancellationFlag,
+    events: async_mpsc::Sender<GenerationEvent>,
+}
+
+#[derive(Debug)]
+pub enum GenerationEvent {
+    Token { id: u32, text: String },
+    Complete(Box<GenerationResult>),
+    Error { message: String, cancelled: bool },
+}
+
+pub struct GenerationTicket {
+    events: async_mpsc::Receiver<GenerationEvent>,
+    cancellation: CancellationFlag,
+}
+
+impl GenerationTicket {
+    pub async fn recv(&mut self) -> Option<GenerationEvent> {
+        self.events.recv().await
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+impl Drop for GenerationTicket {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Loading,
+    Ready,
+    Busy,
+    Failed,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LoadedModelInfo {
+    pub name: String,
+    pub architecture: String,
+    pub backend: String,
+    pub status: WorkerStatus,
+}
+
+impl RuntimeService {
+    pub fn new(
+        paths: Paths,
+        ollama_root: Option<PathBuf>,
+        backend: BackendSelection,
+        limits: RuntimeLimits,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            inner: Arc::new(RuntimeServiceInner {
+                paths,
+                ollama_root,
+                backend,
+                limits: limits.validate()?,
+                workers: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    pub fn limits(&self) -> RuntimeLimits {
+        self.inner.limits
+    }
+
+    pub fn loaded_models(&self) -> Vec<LoadedModelInfo> {
+        let workers = lock_unpoisoned(&self.inner.workers);
+        let mut models = workers
+            .values()
+            .map(|worker| LoadedModelInfo {
+                name: worker.name.clone(),
+                architecture: worker.architecture.clone(),
+                backend: worker.backend.clone(),
+                status: *lock_unpoisoned(&worker.status),
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| left.name.cmp(&right.name));
+        models
+    }
+
+    pub fn generate(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        options: GenerationOptions,
+    ) -> Result<GenerationTicket, ServiceError> {
+        let catalog = ModelCatalog::discover(&self.inner.paths, self.inner.ollama_root.clone())?;
+        let record = catalog.resolve_for_run(model)?;
+        if !record.compatibility.is_metadata_compatible() {
+            return Err(ModelError::NotRunnable {
+                name: record.name,
+                status: record.compatibility.to_string(),
+            }
+            .into());
+        }
+        let architecture = record
+            .architecture
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        if architecture != "gemma4" {
+            return Err(ServiceError::UnsupportedArchitecture {
+                name: record.name,
+                architecture,
+            });
+        }
+        let path = record
+            .path
+            .clone()
+            .ok_or_else(|| ServiceError::MissingModelPath {
+                name: record.name.clone(),
+            })?;
+
+        let mut workers = lock_unpoisoned(&self.inner.workers);
+        if !workers.contains_key(&path) {
+            if workers.len() >= self.inner.limits.maximum_loaded_models {
+                return Err(ServiceError::ModelLimit {
+                    limit: self.inner.limits.maximum_loaded_models,
+                });
+            }
+            let worker = spawn_model_worker(
+                record.name.clone(),
+                path.clone(),
+                architecture,
+                self.inner.backend,
+                self.inner.limits,
+            )?;
+            workers.insert(path.clone(), worker);
+        }
+        let worker = workers.get(&path).expect("worker inserted above");
+        let cancellation = CancellationFlag::default();
+        let (events, receiver) = async_mpsc::channel(self.inner.limits.token_buffer);
+        let job = GenerationJob {
+            messages,
+            options,
+            cancellation: cancellation.clone(),
+            events,
+        };
+        match worker.sender.try_send(job) {
+            Ok(()) => Ok(GenerationTicket {
+                events: receiver,
+                cancellation,
+            }),
+            Err(mpsc::TrySendError::Full(_)) => Err(ServiceError::QueueFull {
+                model: worker.name.clone(),
+            }),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(ServiceError::WorkerStopped {
+                model: worker.name.clone(),
+            }),
+        }
+    }
+}
+
+fn spawn_model_worker(
+    name: String,
+    path: PathBuf,
+    architecture: String,
+    backend: BackendSelection,
+    limits: RuntimeLimits,
+) -> Result<ModelWorker, ServiceError> {
+    let (sender, receiver) = mpsc::sync_channel::<GenerationJob>(limits.request_queue);
+    let status = Arc::new(Mutex::new(WorkerStatus::Loading));
+    let worker_status = Arc::clone(&status);
+    let worker_name = name.clone();
+    thread::Builder::new()
+        .name("diskmule-model".to_owned())
+        .spawn(move || {
+            let engine = GenerationEngine::open_gemma4(worker_name, path, limits.context, backend);
+            match engine {
+                Ok(engine) => {
+                    *lock_unpoisoned(&worker_status) = WorkerStatus::Ready;
+                    run_model_worker(&engine, receiver, &worker_status);
+                }
+                Err(error) => {
+                    *lock_unpoisoned(&worker_status) = WorkerStatus::Failed;
+                    let message = error.to_string();
+                    for job in receiver {
+                        let _ = job.events.blocking_send(GenerationEvent::Error {
+                            message: message.clone(),
+                            cancelled: false,
+                        });
+                    }
+                }
+            }
+            *lock_unpoisoned(&worker_status) = WorkerStatus::Stopped;
+        })
+        .map_err(|source| ServiceError::SpawnWorker {
+            model: name.clone(),
+            source,
+        })?;
+    Ok(ModelWorker {
+        name,
+        architecture,
+        backend: backend.label(),
+        sender,
+        status,
+    })
+}
+
+fn run_model_worker(
+    engine: &GenerationEngine,
+    receiver: mpsc::Receiver<GenerationJob>,
+    status: &Mutex<WorkerStatus>,
+) {
+    for job in receiver {
+        *lock_unpoisoned(status) = WorkerStatus::Busy;
+        if job.cancellation.is_cancelled() {
+            let _ = job.events.blocking_send(GenerationEvent::Error {
+                message: RuntimeError::Cancelled.to_string(),
+                cancelled: true,
+            });
+            *lock_unpoisoned(status) = WorkerStatus::Ready;
+            continue;
+        }
+        let events = job.events.clone();
+        let cancellation = job.cancellation.clone();
+        let result =
+            engine.generate_chat(&job.messages, job.options, &job.cancellation, |id, text| {
+                if events
+                    .blocking_send(GenerationEvent::Token {
+                        id,
+                        text: text.to_owned(),
+                    })
+                    .is_err()
+                {
+                    cancellation.cancel();
+                }
+            });
+        match result {
+            Ok(result) => {
+                let _ = job
+                    .events
+                    .blocking_send(GenerationEvent::Complete(Box::new(result)));
+            }
+            Err(error) => {
+                let cancelled = matches!(error, RuntimeError::Cancelled);
+                let _ = job.events.blocking_send(GenerationEvent::Error {
+                    message: error.to_string(),
+                    cancelled,
+                });
+            }
+        }
+        *lock_unpoisoned(status) = WorkerStatus::Ready;
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct Sampler {
     config: SamplingConfig,
     random: SplitMix64,
@@ -382,7 +751,11 @@ fn expert_residency_from_environment() -> Result<ExpertResidency, RuntimeError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationOptions, Sampler, SamplingConfig};
+    use tokio::sync::mpsc;
+
+    use crate::gemma4::cpu::CancellationFlag;
+
+    use super::{GenerationOptions, GenerationTicket, RuntimeLimits, Sampler, SamplingConfig};
 
     #[test]
     fn greedy_sampling_is_stable_and_uses_lowest_id_for_ties() {
@@ -429,5 +802,37 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_limits_reject_unbounded_or_empty_resources() {
+        assert!(
+            RuntimeLimits {
+                request_queue: 0,
+                ..RuntimeLimits::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RuntimeLimits {
+                maximum_loaded_models: 17,
+                ..RuntimeLimits::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dropping_a_generation_ticket_cancels_its_work() {
+        let cancellation = CancellationFlag::default();
+        let observed = cancellation.clone();
+        let (_sender, events) = mpsc::channel(1);
+        drop(GenerationTicket {
+            events,
+            cancellation,
+        });
+        assert!(observed.is_cancelled());
     }
 }
