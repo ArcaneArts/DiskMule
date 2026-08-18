@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    generation::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError},
     glm52::{
         Glm52Config, Glm52Error, Glm52FeedForwardWeights, Glm52IndexerWeights, Glm52LayerWeights,
         Glm52Weights, IndexerKind,
@@ -217,6 +218,164 @@ impl Glm52CpuModel {
 
     pub fn new_session(&self) -> Glm52CpuSession {
         self.start_session(self.max_context)
+    }
+
+    pub fn generate_session_with_selector<F, S>(
+        &self,
+        session: &mut Glm52CpuSession,
+        prompt_tokens: &[u32],
+        maximum_new_tokens: usize,
+        cancellation: &CancellationFlag,
+        mut select: S,
+        mut on_token: F,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(u32, &str),
+        S: FnMut(&[f32]) -> Result<u32, RuntimeError>,
+    {
+        if prompt_tokens.is_empty() {
+            return Err(RuntimeError::EmptyPrompt);
+        }
+        let requested = prompt_tokens.len().checked_add(maximum_new_tokens).ok_or(
+            RuntimeError::ContextLimit {
+                requested: usize::MAX,
+                limit: session.maximum_context(),
+            },
+        )?;
+        if requested > session.maximum_context() {
+            return Err(RuntimeError::ContextLimit {
+                requested,
+                limit: session.maximum_context(),
+            });
+        }
+
+        let reusable = session
+            .tokens
+            .iter()
+            .zip(prompt_tokens)
+            .take_while(|(left, right)| left == right)
+            .count();
+        let stable_logits = (reusable == session.tokens.len())
+            .then(|| session.logits.clone())
+            .flatten();
+        session.truncate(reusable);
+        session.logits = stable_logits.clone();
+        let cache_before = self.expert_cache_stats()?;
+
+        let result = (|| {
+            let started = Instant::now();
+            let mut profile = GenerationProfile {
+                prompt_tokens: prompt_tokens.len(),
+                reused_prompt_tokens: reusable,
+                ..GenerationProfile::default()
+            };
+            let mut forward_profile = Glm52ForwardProfile::default();
+            let prefill_started = Instant::now();
+            let mut logits = if reusable == prompt_tokens.len() {
+                session.logits.clone().ok_or_else(|| {
+                    RuntimeError::InvalidConfiguration(
+                        "GLM session is missing logits for its cached prompt".to_owned(),
+                    )
+                })?
+            } else {
+                let mut final_logits = None;
+                for token in prompt_tokens.iter().copied().skip(reusable) {
+                    cancellation.check()?;
+                    let output = self.forward_token_profiled(
+                        session,
+                        token,
+                        cancellation.as_atomic(),
+                        &mut forward_profile,
+                    )?;
+                    session.tokens.push(token);
+                    session.logits = Some(output.clone());
+                    final_logits = Some(output);
+                }
+                final_logits.expect("non-empty GLM prompt suffix produces logits")
+            };
+            profile.prefill_time = prefill_started.elapsed();
+
+            let mut generated = Vec::with_capacity(maximum_new_tokens);
+            let mut pending_utf8 = Vec::new();
+            let mut stopped = false;
+            for generation_index in 0..maximum_new_tokens {
+                cancellation.check()?;
+                let next = select(&logits)?;
+                if next as usize >= logits.len() {
+                    return Err(RuntimeError::InvalidToken {
+                        token: next,
+                        vocabulary: logits.len(),
+                    });
+                }
+                if generation_index == 0 {
+                    profile.time_to_first_token = started.elapsed();
+                }
+                if self.config.stop_token_ids.contains(&next) || self.tokenizer.is_special(next) {
+                    stopped = true;
+                    break;
+                }
+                generated.push(next);
+                profile.generated_tokens += 1;
+                pending_utf8.extend(self.tokenizer.decode_token_bytes(next, false)?);
+                let piece = drain_valid_utf8(&mut pending_utf8, false);
+                if !piece.is_empty() {
+                    on_token(next, &piece);
+                }
+                if generation_index + 1 < maximum_new_tokens {
+                    let decode_started = Instant::now();
+                    logits = self.forward_token_profiled(
+                        session,
+                        next,
+                        cancellation.as_atomic(),
+                        &mut forward_profile,
+                    )?;
+                    session.tokens.push(next);
+                    session.logits = Some(logits.clone());
+                    profile.decode_time += decode_started.elapsed();
+                }
+            }
+            if !pending_utf8.is_empty() {
+                let piece = drain_valid_utf8(&mut pending_utf8, true);
+                if !piece.is_empty() {
+                    on_token(
+                        *generated.last().expect("pending bytes have a token"),
+                        &piece,
+                    );
+                }
+            }
+            profile.mapped_bytes_touched = forward_profile.mapped_bytes_touched;
+            profile.resident_kv_bytes = session.resident_state_bytes();
+            profile.embedding_time = forward_profile.embedding_time;
+            profile.attention_time = forward_profile.attention_time;
+            profile.feed_forward_time = forward_profile.feed_forward_time;
+            profile.output_time = forward_profile.output_time;
+            let cache_after = self.expert_cache_stats()?;
+            profile.expert_cache_hits = cache_after.hits.saturating_sub(cache_before.hits);
+            profile.expert_cache_misses = cache_after.misses.saturating_sub(cache_before.misses);
+            profile.expert_cache_evictions =
+                cache_after.evictions.saturating_sub(cache_before.evictions);
+            profile.expert_reads = cache_after.reads.saturating_sub(cache_before.reads);
+            profile.expert_bytes_read = cache_after
+                .bytes_read
+                .saturating_sub(cache_before.bytes_read);
+            profile.expert_io_wait = cache_after
+                .io_wait
+                .checked_sub(cache_before.io_wait)
+                .unwrap_or_default();
+            profile.expert_resident_bytes = cache_after.resident_bytes;
+            profile.total_time = started.elapsed();
+            Ok(GenerationResult {
+                text: self.tokenizer.decode(&generated, false)?,
+                token_ids: generated,
+                stopped,
+                profile,
+            })
+        })();
+        if result.is_err() {
+            session.truncate(reusable);
+            session.logits = stable_logits;
+        }
+        result
     }
 
     pub fn expert_cache_stats(&self) -> Result<Glm52ExpertCacheStats, Glm52CpuError> {
@@ -640,6 +799,29 @@ fn glm_read_cache_policy() -> Result<ReadCachePolicy, Glm52CpuError> {
         _ => Err(Glm52CpuError::InvalidIoConfiguration(
             "DISKMULE_GLM_DIRECT must be 0/1, false/true, or no/yes".to_owned(),
         )),
+    }
+}
+
+fn drain_valid_utf8(bytes: &mut Vec<u8>, final_piece: bool) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            let output = text.to_owned();
+            bytes.clear();
+            output
+        }
+        Err(error) if error.valid_up_to() > 0 => {
+            let valid = error.valid_up_to();
+            let output = String::from_utf8(bytes[..valid].to_vec())
+                .expect("UTF-8 validator identified a valid prefix");
+            bytes.drain(..valid);
+            output
+        }
+        Err(_) if final_piece => {
+            let output = String::from_utf8_lossy(bytes).into_owned();
+            bytes.clear();
+            output
+        }
+        Err(_) => String::new(),
     }
 }
 

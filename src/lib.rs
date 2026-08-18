@@ -1,3 +1,4 @@
+pub mod architecture;
 pub mod chat;
 pub mod cli;
 pub mod config;
@@ -6,6 +7,7 @@ pub mod error;
 #[cfg(target_os = "macos")]
 pub mod expert;
 pub mod gemma4;
+pub mod generation;
 pub mod gguf;
 pub mod glm52;
 pub mod metal;

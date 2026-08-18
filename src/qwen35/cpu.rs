@@ -7,7 +7,7 @@ use crate::{
         self, argmax, dequantize, rms_norm, softmax_in_place, tensor_matvec, tensor_row,
         tensor_vector,
     },
-    gemma4::cpu::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError},
+    generation::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError},
     gguf::TensorSource,
     qwen35::{
         Qwen35AttentionWeights, Qwen35Config, Qwen35LayerWeights, Qwen35Weights,

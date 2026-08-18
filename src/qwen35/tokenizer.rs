@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    gemma4::{ChatMessage, ChatRole},
+    architecture::{ChatMessage, ChatRole},
     gguf::{GgufFile, MetadataArray, MetadataValue},
 };
 

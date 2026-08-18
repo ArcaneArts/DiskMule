@@ -9,6 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    architecture,
     config::Paths,
     gguf::GgufFile,
     glm52::{Glm52Config, Glm52Weights},
@@ -531,8 +532,11 @@ fn inspect_model(
                     Ok(_) => Compatibility::MetadataCompatible,
                     Err(error) => Compatibility::Invalid(error.to_string()),
                 },
+                Some(other) if architecture::capabilities(other).is_some() => {
+                    Compatibility::MetadataCompatible
+                }
                 Some(other) => Compatibility::Unsupported(format!(
-                    "architecture {other}; supported metadata: gemma4, qwen35"
+                    "architecture {other}; no registered runtime"
                 )),
                 None => Compatibility::Invalid("missing general.architecture".to_owned()),
             };

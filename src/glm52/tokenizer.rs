@@ -4,7 +4,7 @@ use std::{collections::HashMap, fs, path::Path, path::PathBuf};
 
 use serde::Deserialize;
 
-use crate::gemma4::{ChatMessage, ChatRole};
+use crate::architecture::{ChatMessage, ChatRole};
 
 const MAX_TOKENIZER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOKEN_ID: usize = 1 << 21;

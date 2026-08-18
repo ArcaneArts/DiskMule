@@ -55,6 +55,8 @@ fn shared_generation_engine_loads_and_runs_qwen35() {
 
     assert_eq!(engine.name(), "tiny-qwen");
     assert_eq!(engine.backend(), BackendSelection::Cpu);
+    assert_eq!(engine.capabilities().architecture, "qwen35");
+    assert!(engine.capabilities().persistent_sessions);
     assert_eq!(result.token_ids, [4]);
     assert_eq!(result.text, "e");
 }

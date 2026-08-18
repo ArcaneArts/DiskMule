@@ -20,7 +20,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::net::TcpListener;
 
 use crate::{
-    gemma4::{ChatMessage, ChatRole, cpu::GenerationProfile},
+    architecture::{BUILTIN_ARCHITECTURES, ChatMessage, ChatRole},
+    generation::GenerationProfile,
     model::ModelError,
     runtime::{
         GenerationEvent, GenerationOptions, GenerationTicket, RuntimeService, SamplingConfig,
@@ -155,6 +156,7 @@ pub async fn serve_listener(
 fn router(runtime: RuntimeService) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/capabilities", get(capabilities))
         .route("/api/loaded", get(loaded_models))
         .route("/api/chat", post(chat))
         .with_state(runtime)
@@ -171,6 +173,13 @@ async fn health(State(runtime): State<RuntimeService>) -> Json<Health> {
 
 async fn loaded_models(State(runtime): State<RuntimeService>) -> impl IntoResponse {
     Json(serde_json::json!({ "models": runtime.loaded_models() }))
+}
+
+async fn capabilities() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "architectures": BUILTIN_ARCHITECTURES,
+        "metal_compiled": cfg!(target_os = "macos"),
+    }))
 }
 
 async fn chat(
@@ -456,6 +465,10 @@ mod tests {
 
         for (path, body) in [
             ("/health", r#"{"status":"ok","service":"diskmule""#),
+            (
+                "/api/capabilities",
+                r#"{"architectures":[{"architecture":"gemma4""#,
+            ),
             ("/api/loaded", r#"{"models":[]}"#),
         ] {
             let response = request(address, &format!("GET {path}"), "").await;

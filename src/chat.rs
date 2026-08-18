@@ -6,8 +6,9 @@ use std::{
 };
 
 use crate::{
+    architecture::{ChatMessage, ChatRole},
     error::{AppError, Result},
-    gemma4::{ChatMessage, ChatRole, cpu::CancellationFlag},
+    generation::CancellationFlag,
     runtime::{
         BackendSelection, GenerationEngine, GenerationEvent, GenerationOptions, RuntimeService,
     },

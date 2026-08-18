@@ -8,6 +8,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::gguf::{GgufFile, MetadataArray, MetadataValue, TensorInfo};
 
+pub use crate::architecture::{ChatMessage, ChatRole};
+
 pub const RUNTIME_ARRAY_KEYS: [&str; 6] = [
     "gemma4.attention.head_count_kv",
     "gemma4.attention.sliding_window_pattern",
@@ -831,28 +833,6 @@ struct Symbol {
     previous: Option<usize>,
     next: Option<usize>,
     active: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatRole {
-    System,
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    pub content: String,
-}
-
-impl ChatMessage {
-    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-        }
-    }
 }
 
 pub fn render_chat(messages: &[ChatMessage]) -> Result<String, Gemma4Error> {

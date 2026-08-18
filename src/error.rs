@@ -33,7 +33,7 @@ pub enum AppError {
     Server(#[from] crate::server::ServerError),
 
     #[error(transparent)]
-    Gemma4(#[from] crate::gemma4::cpu::RuntimeError),
+    Generation(#[from] crate::generation::RuntimeError),
 
     #[error(transparent)]
     Runtime(#[from] crate::runtime::ServiceError),
@@ -60,7 +60,7 @@ impl AppError {
             Self::Gguf(_) => ExitCode::FAILURE,
             Self::Model(_) => ExitCode::FAILURE,
             Self::Server(_) => ExitCode::FAILURE,
-            Self::Gemma4(_) => ExitCode::FAILURE,
+            Self::Generation(_) => ExitCode::FAILURE,
             Self::Runtime(_) => ExitCode::FAILURE,
             Self::SafeTensors(_) => ExitCode::FAILURE,
             Self::Glm52(_) => ExitCode::FAILURE,
