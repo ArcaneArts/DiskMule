@@ -23,7 +23,7 @@ use crate::{
         render_chat,
     },
     glm52::{
-        cpu::{Glm52CpuModel, Glm52CpuSession},
+        cpu::{Glm52CpuModel, Glm52CpuSession, Glm52ForwardProfile},
         tokenizer::render_chat as render_glm52_chat,
     },
     model::{ModelCatalog, ModelError},
@@ -616,6 +616,7 @@ where
             reused_prompt_tokens: reusable,
             ..GenerationProfile::default()
         };
+        let mut forward_profile = Glm52ForwardProfile::default();
         let prefill_started = Instant::now();
         let mut logits = if reusable == prompt_tokens.len() {
             session.logits.clone().ok_or_else(|| {
@@ -629,7 +630,12 @@ where
                 if cancellation.is_cancelled() {
                     return Err(RuntimeError::Cancelled);
                 }
-                let output = model.forward_token(session, token, cancellation.as_atomic())?;
+                let output = model.forward_token_profiled(
+                    session,
+                    token,
+                    cancellation.as_atomic(),
+                    &mut forward_profile,
+                )?;
                 session.tokens.push(token);
                 session.logits = Some(output.clone());
                 final_logits = Some(output);
@@ -668,7 +674,12 @@ where
             }
             if generation_index + 1 < options.maximum_new_tokens {
                 let decode_started = Instant::now();
-                logits = model.forward_token(session, next, cancellation.as_atomic())?;
+                logits = model.forward_token_profiled(
+                    session,
+                    next,
+                    cancellation.as_atomic(),
+                    &mut forward_profile,
+                )?;
                 session.tokens.push(next);
                 session.logits = Some(logits.clone());
                 profile.decode_time += decode_started.elapsed();
@@ -683,6 +694,12 @@ where
                 );
             }
         }
+        profile.mapped_bytes_touched = forward_profile.mapped_bytes_touched;
+        profile.resident_kv_bytes = session.resident_state_bytes();
+        profile.embedding_time = forward_profile.embedding_time;
+        profile.attention_time = forward_profile.attention_time;
+        profile.feed_forward_time = forward_profile.feed_forward_time;
+        profile.output_time = forward_profile.output_time;
         let cache_after = model.expert_cache_stats()?;
         profile.expert_cache_hits = cache_after.hits.saturating_sub(cache_before.hits);
         profile.expert_cache_misses = cache_after.misses.saturating_sub(cache_before.misses);
@@ -1455,6 +1472,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(direct.token_ids, [5]);
+        assert!(direct.profile.mapped_bytes_touched > 0);
+        assert!(direct.profile.resident_kv_bytes > 0);
+        assert!(direct.profile.embedding_time > std::time::Duration::ZERO);
+        assert!(direct.profile.attention_time > std::time::Duration::ZERO);
+        assert!(direct.profile.feed_forward_time > std::time::Duration::ZERO);
+        assert!(direct.profile.output_time > std::time::Duration::ZERO);
         assert!(direct.profile.expert_cache_misses > 0);
         assert!(direct.profile.expert_reads > 0);
 

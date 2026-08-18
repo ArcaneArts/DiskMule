@@ -1,10 +1,12 @@
 //! Payload-lazy CPU execution for GLM-5.2 safetensors weights.
 
 use std::{
+    cell::Cell,
     env,
     path::Path,
     sync::Mutex,
     sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -120,6 +122,16 @@ pub struct Glm52CpuModel {
     metal: Option<Box<Glm52MetalWeights>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Glm52ForwardProfile {
+    pub mapped_bytes_touched: u64,
+    pub resident_kv_bytes: u64,
+    pub embedding_time: Duration,
+    pub attention_time: Duration,
+    pub feed_forward_time: Duration,
+    pub output_time: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Glm52CpuSession {
     maximum_context: usize,
@@ -231,6 +243,21 @@ impl Glm52CpuModel {
         token: u32,
         cancelled: &AtomicBool,
     ) -> Result<Vec<f32>, Glm52CpuError> {
+        self.forward_token_profiled(
+            session,
+            token,
+            cancelled,
+            &mut Glm52ForwardProfile::default(),
+        )
+    }
+
+    pub fn forward_token_profiled(
+        &self,
+        session: &mut Glm52CpuSession,
+        token: u32,
+        cancelled: &AtomicBool,
+        profile: &mut Glm52ForwardProfile,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
         if session.layers.len() != self.config.layer_count {
             return Err(Glm52CpuError::SessionLayers {
                 expected: self.config.layer_count,
@@ -250,7 +277,7 @@ impl Glm52CpuModel {
             });
         }
         let previous_selection = session.dsa_selection.clone();
-        let result = self.forward_token_inner(session, token, position, cancelled);
+        let result = self.forward_token_inner(session, token, position, cancelled, profile);
         if result.is_err() {
             for layer in &mut session.layers {
                 layer.latent.truncate(position);
@@ -259,6 +286,9 @@ impl Glm52CpuModel {
             }
             session.dsa_selection = previous_selection;
             session.dsa_history.truncate(position);
+        }
+        if result.is_ok() {
+            profile.resident_kv_bytes = session.resident_state_bytes();
         }
         result
     }
@@ -269,6 +299,7 @@ impl Glm52CpuModel {
         token: u32,
         position: usize,
         cancelled: &AtomicBool,
+        profile: &mut Glm52ForwardProfile,
     ) -> Result<Vec<f32>, Glm52CpuError> {
         check_cancelled(cancelled)?;
         let mut reader = TensorReader::new(&self.source);
@@ -276,11 +307,14 @@ impl Glm52CpuModel {
         if let Some(metal) = self.metal.as_ref() {
             reader = reader.with_metal(metal);
         }
+        let embedding_started = Instant::now();
         let mut hidden = reader.matrix_row(self.weights.token_embedding, token as usize)?;
+        profile.embedding_time += embedding_started.elapsed();
         for (layer_index, weights) in self.weights.layers.iter().enumerate() {
             check_cancelled(cancelled)?;
             let input_norm = reader.vector(weights.input_norm)?;
             let normalized = rms_norm(&hidden, &input_norm, self.config.rms_epsilon);
+            let attention_started = Instant::now();
             let attention = self.attention(
                 &reader,
                 session,
@@ -291,7 +325,9 @@ impl Glm52CpuModel {
                 cancelled,
             )?;
             add_in_place(&mut hidden, &attention);
+            profile.attention_time += attention_started.elapsed();
 
+            let feed_forward_started = Instant::now();
             let post_norm = reader.vector(weights.post_attention_norm)?;
             let normalized = rms_norm(&hidden, &post_norm, self.config.rms_epsilon);
             let feed_forward = self.feed_forward(
@@ -302,11 +338,17 @@ impl Glm52CpuModel {
                 cancelled,
             )?;
             add_in_place(&mut hidden, &feed_forward);
+            profile.feed_forward_time += feed_forward_started.elapsed();
         }
         check_cancelled(cancelled)?;
+        let output_started = Instant::now();
         let final_norm = reader.vector(self.weights.output_norm)?;
         let normalized = rms_norm(&hidden, &final_norm, self.config.rms_epsilon);
         let logits = reader.matvec(self.weights.output, &normalized)?;
+        profile.output_time += output_started.elapsed();
+        profile.mapped_bytes_touched = profile
+            .mapped_bytes_touched
+            .saturating_add(reader.bytes_touched());
         session.dsa_history.push(session.dsa_selection.clone());
         Ok(logits)
     }
@@ -590,6 +632,40 @@ impl Glm52CpuSession {
         self.maximum_context
     }
 
+    pub fn resident_state_bytes(&self) -> u64 {
+        let mut bytes = self
+            .layers
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Glm52LayerCache>());
+        for layer in &self.layers {
+            bytes = bytes
+                .saturating_add(nested_f32_bytes(&layer.latent, layer.latent.capacity()))
+                .saturating_add(nested_f32_bytes(&layer.rope, layer.rope.capacity()))
+                .saturating_add(nested_f32_bytes(
+                    &layer.index_keys,
+                    layer.index_keys.capacity(),
+                ));
+        }
+        bytes = bytes
+            .saturating_add(self.dsa_selection.as_ref().map_or(0, |selection| {
+                selection.capacity() * std::mem::size_of::<usize>()
+            }))
+            .saturating_add(
+                self.dsa_history
+                    .iter()
+                    .flatten()
+                    .map(|selection| selection.capacity() * std::mem::size_of::<usize>())
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.tokens.capacity() * std::mem::size_of::<u32>())
+            .saturating_add(
+                self.logits
+                    .as_ref()
+                    .map_or(0, |logits| logits.capacity() * std::mem::size_of::<f32>()),
+            );
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
     pub(crate) fn truncate(&mut self, length: usize) {
         for layer in &mut self.layers {
             layer.latent.truncate(length);
@@ -600,6 +676,17 @@ impl Glm52CpuSession {
         self.dsa_selection = self.dsa_history.last().cloned().flatten();
         self.tokens.truncate(length);
     }
+}
+
+fn nested_f32_bytes(values: &[Vec<f32>], capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<Vec<f32>>())
+        .saturating_add(
+            values
+                .iter()
+                .map(|value| value.capacity().saturating_mul(std::mem::size_of::<f32>()))
+                .sum::<usize>(),
+        )
 }
 
 fn mlp(
@@ -704,6 +791,7 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Glm52CpuError> {
 /// Reads and computes directly from safetensors ranges without materializing a shard.
 pub struct TensorReader<'a> {
     source: &'a SafeTensorSource,
+    bytes_touched: Cell<u64>,
     #[cfg(target_os = "macos")]
     metal: Option<&'a Glm52MetalWeights>,
 }
@@ -712,6 +800,7 @@ impl<'a> TensorReader<'a> {
     pub const fn new(source: &'a SafeTensorSource) -> Self {
         Self {
             source,
+            bytes_touched: Cell::new(0),
             #[cfg(target_os = "macos")]
             metal: None,
         }
@@ -723,12 +812,17 @@ impl<'a> TensorReader<'a> {
         self
     }
 
+    pub fn bytes_touched(&self) -> u64 {
+        self.bytes_touched.get()
+    }
+
     pub fn vector(&self, tensor_index: usize) -> Result<Vec<f32>, Glm52CpuError> {
         let tensor = self.tensor(tensor_index)?;
         require_rank(tensor, 1)?;
         let length = dimension(tensor, tensor.shape[0])?;
         let mut values = vec![0.0; length];
         self.read_dense_values(tensor, 0, &mut values)?;
+        self.note_bytes(tensor.byte_len);
         Ok(values)
     }
 
@@ -771,7 +865,13 @@ impl<'a> TensorReader<'a> {
         match tensor.dtype {
             SafeDtype::F8E4M3 => self.read_fp8_row(tensor, row, output),
             _ => self.read_dense_values(tensor, offset, output),
-        }
+        }?;
+        let row_bytes = u64::try_from(columns)
+            .ok()
+            .and_then(|columns| columns.checked_mul(tensor.dtype.byte_width()))
+            .unwrap_or(u64::MAX);
+        self.note_bytes(row_bytes);
+        Ok(())
     }
 
     pub fn matvec(&self, tensor_index: usize, input: &[f32]) -> Result<Vec<f32>, Glm52CpuError> {
@@ -807,6 +907,15 @@ impl<'a> TensorReader<'a> {
                 actual: output.len(),
             });
         }
+        self.note_bytes(tensor.byte_len);
+        if tensor.dtype == SafeDtype::F8E4M3
+            && let Some(scale) = self
+                .source
+                .index
+                .tensor(&format!("{}_scale_inv", tensor.name))
+        {
+            self.note_bytes(scale.byte_len);
+        }
         #[cfg(target_os = "macos")]
         if let Some(metal) = self.metal {
             metal.matvec(self.source, tensor_index, input, output)?;
@@ -814,7 +923,7 @@ impl<'a> TensorReader<'a> {
         }
         let mut row = vec![0.0; columns];
         for (row_index, result) in output.iter_mut().enumerate() {
-            self.matrix_row_into(tensor_index, row_index, &mut row)?;
+            self.matrix_row_into_untracked(tensor, row_index, &mut row)?;
             *result = row
                 .iter()
                 .zip(input)
@@ -822,6 +931,27 @@ impl<'a> TensorReader<'a> {
                 .sum();
         }
         Ok(())
+    }
+
+    fn matrix_row_into_untracked(
+        &self,
+        tensor: &SafeTensorInfo,
+        row: usize,
+        output: &mut [f32],
+    ) -> Result<(), Glm52CpuError> {
+        let columns = dimension(tensor, tensor.shape[1])?;
+        let offset = row
+            .checked_mul(columns)
+            .ok_or_else(|| Glm52CpuError::Overflow(tensor.name.clone()))?;
+        match tensor.dtype {
+            SafeDtype::F8E4M3 => self.read_fp8_row(tensor, row, output),
+            _ => self.read_dense_values(tensor, offset, output),
+        }
+    }
+
+    fn note_bytes(&self, bytes: u64) {
+        self.bytes_touched
+            .set(self.bytes_touched.get().saturating_add(bytes));
     }
 
     fn tensor(&self, index: usize) -> Result<&SafeTensorInfo, Glm52CpuError> {
