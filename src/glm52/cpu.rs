@@ -117,7 +117,7 @@ pub struct Glm52CpuModel {
     max_context: usize,
     expert_cache: Mutex<Glm52ExpertCache>,
     #[cfg(target_os = "macos")]
-    metal: Option<Glm52MetalWeights>,
+    metal: Option<Box<Glm52MetalWeights>>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +181,7 @@ impl Glm52CpuModel {
         let expert_cache = Glm52ExpertCache::new(source.clone(), &weights, expert_cache_slots()?)?;
         #[cfg(target_os = "macos")]
         let metal = use_metal
-            .then(|| Glm52MetalWeights::new(&source))
+            .then(|| Glm52MetalWeights::new(&source).map(Box::new))
             .transpose()?;
         Ok(Self {
             config,
@@ -197,7 +197,7 @@ impl Glm52CpuModel {
 
     #[cfg(target_os = "macos")]
     pub fn metal_device_name(&self) -> Option<String> {
-        self.metal.as_ref().map(Glm52MetalWeights::device_name)
+        self.metal.as_deref().map(Glm52MetalWeights::device_name)
     }
 
     pub fn new_session(&self) -> Glm52CpuSession {
@@ -548,7 +548,13 @@ impl Glm52CpuModel {
                         .expert_cache
                         .lock()
                         .map_err(|_| Glm52ExpertCacheError::Poisoned)?
-                        .with_expert(layer, expert, cancelled, |cached| cached.mlp(hidden))?;
+                        .with_expert(layer, expert, cancelled, |cached| {
+                            #[cfg(target_os = "macos")]
+                            if let Some(metal) = reader.metal {
+                                return metal.expert_mlp(cached, hidden);
+                            }
+                            cached.mlp(hidden)
+                        })?;
                     for (output, value) in output.iter_mut().zip(expert_output) {
                         *output += value * weight * self.config.routed_scale;
                     }

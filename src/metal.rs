@@ -153,6 +153,7 @@ mod implementation {
     const RMS_NORM: &str = "rms_norm";
     const ROPE_NEOX: &str = "rope_neox";
     const GELU_MUL: &str = "gelu_mul";
+    const SILU_MUL: &str = "silu_mul";
     const STABLE_SOFTMAX: &str = "stable_softmax";
     const LOGIT_SOFTCAP: &str = "logit_softcap";
     const DETERMINISTIC_ARGMAX: &str = "deterministic_argmax";
@@ -181,6 +182,7 @@ mod implementation {
         rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         rope_neox: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         gelu_mul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        silu_mul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         stable_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         logit_softcap: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         deterministic_argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -293,6 +295,7 @@ mod implementation {
             let rms_norm = pipeline(&device, &library, RMS_NORM)?;
             let rope_neox = pipeline(&device, &library, ROPE_NEOX)?;
             let gelu_mul = pipeline(&device, &library, GELU_MUL)?;
+            let silu_mul = pipeline(&device, &library, SILU_MUL)?;
             let stable_softmax = pipeline(&device, &library, STABLE_SOFTMAX)?;
             let logit_softcap = pipeline(&device, &library, LOGIT_SOFTCAP)?;
             let deterministic_argmax = pipeline(&device, &library, DETERMINISTIC_ARGMAX)?;
@@ -315,6 +318,7 @@ mod implementation {
                 rms_norm,
                 rope_neox,
                 gelu_mul,
+                silu_mul,
                 stable_softmax,
                 logit_softcap,
                 deterministic_argmax,
@@ -531,6 +535,30 @@ mod implementation {
             let count_buffer = self.buffer_with_data(&[count])?;
             self.execute(
                 &self.gelu_mul,
+                &[&gate_buffer, &up_buffer, &output_buffer, &count_buffer],
+                gate.len(),
+                gate.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn silu_mul(
+            &self,
+            gate: &[f32],
+            up: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            require_nonempty("SiLU multiply", gate)?;
+            validate_vector_length("SiLU multiply", "up", gate.len(), up.len())?;
+            validate_vector_length("SiLU multiply", "output", gate.len(), output.len())?;
+            let count = count_u32(gate.len())?;
+            let gate_buffer = self.buffer_with_data(gate)?;
+            let up_buffer = self.buffer_with_data(up)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            self.execute(
+                &self.silu_mul,
                 &[&gate_buffer, &up_buffer, &output_buffer, &count_buffer],
                 gate.len(),
                 gate.len().min(REDUCTION_THREADS),
@@ -817,6 +845,116 @@ mod implementation {
                     (&mapping.buffer, encoded_offset),
                     (&scale_mapping.buffer, scale_offset),
                     &[
+                        &input_buffer,
+                        &output_buffer,
+                        &columns_buffer,
+                        &scale_columns_buffer,
+                    ],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?;
+            }
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        /// Execute a safetensors GEMV from a bounded host-resident tensor.
+        #[allow(clippy::too_many_arguments)]
+        pub fn matvec_safetensor(
+            &self,
+            dtype: SafeDtype,
+            rows: usize,
+            columns: usize,
+            encoded: &[u8],
+            scales: Option<&[f32]>,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            match dtype {
+                SafeDtype::F32 => {
+                    return self.matvec(TensorType::F32, rows, columns, encoded, input, output);
+                }
+                SafeDtype::F16 => {
+                    return self.matvec(TensorType::F16, rows, columns, encoded, input, output);
+                }
+                SafeDtype::Bf16 | SafeDtype::F8E4M3 => {}
+                _ => return Err(MetalError::UnsupportedTensorType("safetensors dtype")),
+            }
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let byte_width = if dtype == SafeDtype::Bf16 { 2 } else { 1 };
+            let expected = rows
+                .checked_mul(columns)
+                .and_then(|elements| elements.checked_mul(byte_width))
+                .ok_or(MetalError::Overflow)?;
+            if encoded.len() != expected {
+                return Err(MetalError::InvalidByteLength {
+                    kind: if dtype == SafeDtype::Bf16 {
+                        "BF16"
+                    } else {
+                        "F8_E4M3FN"
+                    },
+                    expected,
+                    actual: encoded.len(),
+                });
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("safetensors matvec", input)?;
+            let encoded_buffer = self.buffer_with_data(encoded)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            if dtype == SafeDtype::Bf16 {
+                let row_bytes_buffer = self.buffer_with_data(&[count_u32(columns * 2)?])?;
+                self.execute(
+                    &self.matvec_bf16,
+                    &[
+                        &encoded_buffer,
+                        &input_buffer,
+                        &output_buffer,
+                        &columns_buffer,
+                        &row_bytes_buffer,
+                    ],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?;
+            } else {
+                let expected_scales = rows
+                    .div_ceil(128)
+                    .checked_mul(columns.div_ceil(128))
+                    .ok_or(MetalError::Overflow)?;
+                let scales = scales.ok_or(MetalError::InvalidVectorLength {
+                    operation: "F8_E4M3FN matvec",
+                    argument: "scales",
+                    expected: expected_scales,
+                    actual: 0,
+                })?;
+                validate_vector_length(
+                    "F8_E4M3FN matvec",
+                    "scales",
+                    expected_scales,
+                    scales.len(),
+                )?;
+                let scales_buffer = self.buffer_with_data(scales)?;
+                let scale_columns_buffer =
+                    self.buffer_with_data(&[count_u32(columns.div_ceil(128))?])?;
+                self.execute(
+                    &self.matvec_f8_e4m3fn,
+                    &[
+                        &encoded_buffer,
+                        &scales_buffer,
                         &input_buffer,
                         &output_buffer,
                         &columns_buffer,
@@ -1744,6 +1882,16 @@ mod implementation {
                 .unwrap();
             assert_close(&actual_large, &expected_large, 2.0e-5);
 
+            let expected_silu = large_gate
+                .iter()
+                .zip(large_up)
+                .map(|(gate, up)| (gate / (1.0 + (-gate).exp())) * up)
+                .collect::<Vec<_>>();
+            context
+                .silu_mul(&large_gate, &large_up, &mut actual_large)
+                .unwrap();
+            assert_close(&actual_large, &expected_silu, 2.0e-5);
+
             let mut expected_softmax = input.clone();
             cpu::softmax_in_place(&mut expected_softmax).unwrap();
             let mut actual_softmax = vec![0.0; input.len()];
@@ -1874,6 +2022,18 @@ mod implementation {
                 )
                 .unwrap();
             assert_close(&bf16_output, &[1.5, -0.5], 1e-6);
+            context
+                .matvec_safetensor(
+                    SafeDtype::Bf16,
+                    2,
+                    3,
+                    &bf16,
+                    None,
+                    &[2.0, -1.0, 0.5],
+                    &mut bf16_output,
+                )
+                .unwrap();
+            assert_close(&bf16_output, &[1.5, -0.5], 1e-6);
 
             let mut input = vec![1.0; 130];
             input[129] = 2.0;
@@ -1887,6 +2047,23 @@ mod implementation {
                     fp8_offset,
                     fp8.len(),
                     Some((&mapped, scale_offset, scales.len())),
+                    &input,
+                    &mut fp8_output,
+                )
+                .unwrap();
+            assert_close(&fp8_output[..128], &vec![265.0; 128], 1e-5);
+            assert!((fp8_output[128] - 661.0).abs() < 1e-5);
+            let scale_values = scales
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            context
+                .matvec_safetensor(
+                    SafeDtype::F8E4M3,
+                    129,
+                    130,
+                    &fp8,
+                    Some(&scale_values),
                     &input,
                     &mut fp8_output,
                 )

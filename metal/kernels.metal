@@ -109,6 +109,18 @@ kernel void gelu_mul(
     }
 }
 
+kernel void silu_mul(
+    device const float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < count) {
+        const float value = gate[index];
+        output[index] = (value / (1.0f + exp(-value))) * up[index];
+    }
+}
+
 kernel void stable_softmax(
     device const float *input [[buffer(0)]],
     device float *output [[buffer(1)]],

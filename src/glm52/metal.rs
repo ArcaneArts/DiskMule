@@ -5,6 +5,7 @@ use std::{fs::File, sync::Arc};
 use memmap2::MmapOptions;
 
 use crate::{
+    glm52::expert::{CachedExpert, Glm52ExpertCacheError},
     metal::{MetalContext, MetalError, MetalMappedBuffer},
     safetensors::{SafeDtype, SafeTensorSource},
 };
@@ -37,6 +38,14 @@ impl Glm52MetalWeights {
 
     pub fn device_name(&self) -> String {
         self.context.device_name()
+    }
+
+    pub fn expert_mlp(
+        &self,
+        expert: &CachedExpert,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Glm52ExpertCacheError> {
+        expert.mlp_metal(&self.context, input)
     }
 
     pub fn matvec(

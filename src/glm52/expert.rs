@@ -7,12 +7,19 @@ use crate::{
     safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
 };
 
+#[cfg(target_os = "macos")]
+use crate::metal::{MetalContext, MetalError};
+
 const FP8_BLOCK: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Glm52ExpertCacheError {
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Metal(#[from] MetalError),
 
     #[error("GLM expert cache requires at least one slot")]
     NoSlots,
@@ -253,6 +260,19 @@ impl CachedExpert {
         self.down.matvec(&gate)
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn mlp_metal(
+        &self,
+        context: &MetalContext,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Glm52ExpertCacheError> {
+        let gate = self.gate.matvec_metal(context, input)?;
+        let up = self.up.matvec_metal(context, input)?;
+        let mut activated = vec![0.0; gate.len()];
+        context.silu_mul(&gate, &up, &mut activated)?;
+        self.down.matvec_metal(context, &activated)
+    }
+
     fn resident_bytes(&self) -> u64 {
         self.gate
             .resident_bytes()
@@ -357,6 +377,35 @@ impl CachedTensor {
             }
             *output = sum;
         }
+        Ok(output)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn matvec_metal(
+        &self,
+        context: &MetalContext,
+        input: &[f32],
+    ) -> Result<Vec<f32>, Glm52ExpertCacheError> {
+        let rows = usize::try_from(self.info.shape[0]).map_err(|_| {
+            Glm52ExpertCacheError::TensorTooLarge {
+                tensor: self.info.name.clone(),
+            }
+        })?;
+        let columns = usize::try_from(self.info.shape[1]).map_err(|_| {
+            Glm52ExpertCacheError::TensorTooLarge {
+                tensor: self.info.name.clone(),
+            }
+        })?;
+        let mut output = vec![0.0; rows];
+        context.matvec_safetensor(
+            self.info.dtype,
+            rows,
+            columns,
+            &self.bytes,
+            (self.info.dtype == SafeDtype::F8E4M3).then_some(self.scales.as_slice()),
+            input,
+            &mut output,
+        )?;
         Ok(output)
     }
 

@@ -318,10 +318,10 @@ pub struct GenerationEngine {
 }
 
 enum ArchitectureModel {
-    Gemma4Cpu(Gemma4CpuModel),
-    Glm52Cpu(Glm52CpuModel),
+    Gemma4Cpu(Box<Gemma4CpuModel>),
+    Glm52Cpu(Box<Glm52CpuModel>),
     #[cfg(target_os = "macos")]
-    Gemma4Metal(Gemma4MetalModel),
+    Gemma4Metal(Box<Gemma4MetalModel>),
 }
 
 enum ArchitectureSession {
@@ -362,12 +362,12 @@ impl GenerationEngine {
         let path = path.as_ref().to_path_buf();
         let model = match backend {
             BackendSelection::Cpu => {
-                ArchitectureModel::Gemma4Cpu(Gemma4CpuModel::open(&path, context)?)
+                ArchitectureModel::Gemma4Cpu(Box::new(Gemma4CpuModel::open(&path, context)?))
             }
             #[cfg(target_os = "macos")]
-            BackendSelection::Metal { residency } => ArchitectureModel::Gemma4Metal(
+            BackendSelection::Metal { residency } => ArchitectureModel::Gemma4Metal(Box::new(
                 Gemma4MetalModel::open_with_expert_residency(&path, context, residency)?,
-            ),
+            )),
         };
         Ok(Self {
             name: name.into(),
@@ -395,7 +395,7 @@ impl GenerationEngine {
             name: name.into(),
             path,
             backend,
-            model: ArchitectureModel::Glm52Cpu(model),
+            model: ArchitectureModel::Glm52Cpu(Box::new(model)),
         })
     }
 
