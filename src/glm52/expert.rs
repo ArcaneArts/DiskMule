@@ -3,7 +3,10 @@
 use std::{sync::atomic::AtomicBool, time::Duration, time::Instant};
 
 use crate::{
-    glm52::{Glm52FeedForwardWeights, Glm52Weights},
+    glm52::{
+        Glm52FeedForwardWeights, Glm52Weights,
+        quant::{GlmQuantization, GlmQuantizationError, infer_quantization_from_scale_count},
+    },
     safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
 };
 
@@ -21,6 +24,9 @@ pub enum Glm52ExpertCacheError {
     #[error(transparent)]
     Metal(#[from] MetalError),
 
+    #[error(transparent)]
+    Quantization(#[from] GlmQuantizationError),
+
     #[error("GLM expert cache requires at least one slot")]
     NoSlots,
 
@@ -36,7 +42,7 @@ pub enum Glm52ExpertCacheError {
     #[error("GLM expert tensor {tensor:?} has invalid cached shape {shape:?}")]
     InvalidShape { tensor: String, shape: Vec<u64> },
 
-    #[error("GLM expert tensor {tensor:?} is missing its FP8 scale grid")]
+    #[error("GLM expert tensor {tensor:?} is missing its scale data")]
     MissingScale { tensor: String },
 
     #[error("GLM expert cache operation was cancelled")]
@@ -294,7 +300,7 @@ impl CachedTensor {
             .ok_or_else(|| Glm52ExpertCacheError::TensorTooLarge {
                 tensor: format!("index {tensor_index}"),
             })?;
-        if info.shape.len() != 2 {
+        if info.dtype != SafeDtype::U8 && info.shape.len() != 2 {
             return Err(Glm52ExpertCacheError::InvalidShape {
                 tensor: info.name,
                 shape: info.shape,
@@ -302,7 +308,7 @@ impl CachedTensor {
         }
         if !matches!(
             info.dtype,
-            SafeDtype::F32 | SafeDtype::F16 | SafeDtype::Bf16 | SafeDtype::F8E4M3
+            SafeDtype::F32 | SafeDtype::F16 | SafeDtype::Bf16 | SafeDtype::F8E4M3 | SafeDtype::U8
         ) {
             return Err(Glm52ExpertCacheError::UnsupportedDtype {
                 tensor: info.name,
@@ -319,13 +325,22 @@ impl CachedTensor {
             reads: 1,
             bytes: info.byte_len,
         };
-        let scales = if info.dtype == SafeDtype::F8E4M3 {
-            let scale_name = format!("{}_scale_inv", info.name);
+        let scales = if matches!(info.dtype, SafeDtype::F8E4M3 | SafeDtype::U8) {
+            let scale_name = match info.dtype {
+                SafeDtype::F8E4M3 => format!("{}_scale_inv", info.name),
+                SafeDtype::U8 => format!("{}.qs", info.name),
+                _ => unreachable!("dtype checked above"),
+            };
             let scale = source.index.tensor(&scale_name).ok_or_else(|| {
                 Glm52ExpertCacheError::MissingScale {
                     tensor: info.name.clone(),
                 }
             })?;
+            if scale.dtype != SafeDtype::F32 || !scale.byte_len.is_multiple_of(4) {
+                return Err(Glm52ExpertCacheError::MissingScale {
+                    tensor: info.name.clone(),
+                });
+            }
             let scale_length = usize::try_from(scale.byte_len).map_err(|_| {
                 Glm52ExpertCacheError::TensorTooLarge {
                     tensor: scale.name.clone(),
@@ -353,16 +368,7 @@ impl CachedTensor {
     }
 
     fn matvec(&self, input: &[f32]) -> Result<Vec<f32>, Glm52ExpertCacheError> {
-        let rows = usize::try_from(self.info.shape[0]).map_err(|_| {
-            Glm52ExpertCacheError::TensorTooLarge {
-                tensor: self.info.name.clone(),
-            }
-        })?;
-        let columns = usize::try_from(self.info.shape[1]).map_err(|_| {
-            Glm52ExpertCacheError::TensorTooLarge {
-                tensor: self.info.name.clone(),
-            }
-        })?;
+        let (rows, columns, quantization) = self.logical_shape(input.len())?;
         if input.len() != columns {
             return Err(Glm52ExpertCacheError::InvalidShape {
                 tensor: self.info.name.clone(),
@@ -373,7 +379,7 @@ impl CachedTensor {
         for (row, output) in output.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (column, input) in input.iter().enumerate() {
-                sum += self.value(row, column, columns)? * input;
+                sum += self.value(row, column, columns, quantization)? * input;
             }
             *output = sum;
         }
@@ -386,23 +392,15 @@ impl CachedTensor {
         context: &MetalContext,
         input: &[f32],
     ) -> Result<Vec<f32>, Glm52ExpertCacheError> {
-        let rows = usize::try_from(self.info.shape[0]).map_err(|_| {
-            Glm52ExpertCacheError::TensorTooLarge {
-                tensor: self.info.name.clone(),
-            }
-        })?;
-        let columns = usize::try_from(self.info.shape[1]).map_err(|_| {
-            Glm52ExpertCacheError::TensorTooLarge {
-                tensor: self.info.name.clone(),
-            }
-        })?;
+        let (rows, columns, _) = self.logical_shape(input.len())?;
         let mut output = vec![0.0; rows];
         context.matvec_safetensor(
             self.info.dtype,
             rows,
             columns,
             &self.bytes,
-            (self.info.dtype == SafeDtype::F8E4M3).then_some(self.scales.as_slice()),
+            matches!(self.info.dtype, SafeDtype::F8E4M3 | SafeDtype::U8)
+                .then_some(self.scales.as_slice()),
             input,
             &mut output,
         )?;
@@ -414,6 +412,7 @@ impl CachedTensor {
         row: usize,
         column: usize,
         columns: usize,
+        quantization: Option<GlmQuantization>,
     ) -> Result<f32, Glm52ExpertCacheError> {
         let index = row * columns + column;
         Ok(match self.info.dtype {
@@ -441,6 +440,21 @@ impl CachedTensor {
                     }
                 })? * self.scales[(row / FP8_BLOCK) * scale_columns + column / FP8_BLOCK]
             }
+            SafeDtype::U8 => match quantization.expect("U8 layout resolved before value access") {
+                GlmQuantization::Int8Row => f32::from(self.bytes[index] as i8) * self.scales[row],
+                GlmQuantization::Int4Grouped { group_size } => {
+                    let row_bytes = columns.div_ceil(2);
+                    let byte = self.bytes[row * row_bytes + column / 2];
+                    let nibble = if column.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    let scale_columns = columns.div_ceil(group_size);
+                    (f32::from(nibble) - 8.0)
+                        * self.scales[row * scale_columns + column / group_size]
+                }
+            },
             dtype => {
                 return Err(Glm52ExpertCacheError::UnsupportedDtype {
                     tensor: self.info.name.clone(),
@@ -448,6 +462,33 @@ impl CachedTensor {
                 });
             }
         })
+    }
+
+    fn logical_shape(
+        &self,
+        input_columns: usize,
+    ) -> Result<(usize, usize, Option<GlmQuantization>), Glm52ExpertCacheError> {
+        if self.info.dtype == SafeDtype::U8 {
+            let scale_count = u64::try_from(self.scales.len()).map_err(|_| {
+                Glm52ExpertCacheError::TensorTooLarge {
+                    tensor: self.info.name.clone(),
+                }
+            })?;
+            let (rows, quantization) =
+                infer_quantization_from_scale_count(&self.info, scale_count, input_columns)?;
+            return Ok((rows, input_columns, Some(quantization)));
+        }
+        let rows = usize::try_from(self.info.shape[0]).map_err(|_| {
+            Glm52ExpertCacheError::TensorTooLarge {
+                tensor: self.info.name.clone(),
+            }
+        })?;
+        let columns = usize::try_from(self.info.shape[1]).map_err(|_| {
+            Glm52ExpertCacheError::TensorTooLarge {
+                tensor: self.info.name.clone(),
+            }
+        })?;
+        Ok((rows, columns, None))
     }
 
     fn resident_bytes(&self) -> u64 {

@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod expert;
 #[cfg(target_os = "macos")]
 pub mod metal;
+pub mod quant;
 pub mod tokenizer;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
@@ -63,6 +64,9 @@ pub enum Glm52Error {
         scale: String,
         expected: Vec<u64>,
     },
+
+    #[error(transparent)]
+    Quantization(#[from] quant::GlmQuantizationError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,7 +524,7 @@ impl Glm52Weights {
             };
             let indexer = (config.indexer_kinds[layer] == IndexerKind::Full)
                 .then(|| {
-                    Ok(Glm52IndexerWeights {
+                    Ok::<_, Glm52Error>(Glm52IndexerWeights {
                         query: required_matrix(
                             index,
                             &name("self_attn.indexer.wq_b.weight"),
@@ -599,7 +603,7 @@ fn required_tensor(
     index: &SafeTensorIndex,
     name: &str,
     expected: &[u64],
-    allow_fp8: bool,
+    allow_quantized: bool,
 ) -> Result<usize, Glm52Error> {
     let tensor_index = index
         .tensors()
@@ -607,6 +611,10 @@ fn required_tensor(
         .position(|tensor| tensor.name == name)
         .ok_or_else(|| Glm52Error::MissingTensor(name.to_owned()))?;
     let tensor = &index.tensors()[tensor_index];
+    if tensor.dtype == SafeDtype::U8 && allow_quantized && expected.len() == 2 {
+        quant::resolve_quantization(index, tensor, expected[0], expected[1])?;
+        return Ok(tensor_index);
+    }
     if tensor.shape != expected {
         return Err(Glm52Error::TensorShape {
             tensor: name.to_owned(),
@@ -616,7 +624,7 @@ fn required_tensor(
     }
     match tensor.dtype {
         SafeDtype::F32 | SafeDtype::F16 | SafeDtype::Bf16 => {}
-        SafeDtype::F8E4M3 if allow_fp8 => validate_fp8_scale(index, tensor)?,
+        SafeDtype::F8E4M3 if allow_quantized => validate_fp8_scale(index, tensor)?,
         dtype => {
             return Err(Glm52Error::TensorDtype {
                 tensor: name.to_owned(),

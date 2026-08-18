@@ -15,6 +15,7 @@ use crate::{
         Glm52Config, Glm52Error, Glm52FeedForwardWeights, Glm52IndexerWeights, Glm52LayerWeights,
         Glm52Weights, IndexerKind,
         expert::{Glm52ExpertCache, Glm52ExpertCacheError, Glm52ExpertCacheStats},
+        quant::{GlmQuantization, GlmQuantizationError, infer_quantization, resolve_quantization},
         tokenizer::{Glm52Tokenizer, Glm52TokenizerError},
     },
     safetensors::{ReadCachePolicy, SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
@@ -35,6 +36,9 @@ pub enum Glm52CpuError {
 
     #[error(transparent)]
     ExpertCache(#[from] Glm52ExpertCacheError),
+
+    #[error(transparent)]
+    Quantization(#[from] GlmQuantizationError),
 
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
@@ -474,7 +478,11 @@ impl Glm52CpuModel {
             reader = reader.with_metal(metal);
         }
         let embedding_started = Instant::now();
-        let mut hidden = reader.matrix_row(self.weights.token_embedding, token as usize)?;
+        let mut hidden = reader.matrix_row_with_columns(
+            self.weights.token_embedding,
+            token as usize,
+            self.config.hidden_size,
+        )?;
         profile.embedding_time += embedding_started.elapsed();
         for (layer_index, weights) in self.weights.layers.iter().enumerate() {
             check_cancelled(cancelled)?;
@@ -1032,6 +1040,15 @@ impl<'a> TensorReader<'a> {
         let tensor = self.tensor(tensor_index)?;
         require_rank(tensor, 2)?;
         let columns = dimension(tensor, tensor.shape[1])?;
+        self.matrix_row_with_columns(tensor_index, row, columns)
+    }
+
+    fn matrix_row_with_columns(
+        &self,
+        tensor_index: usize,
+        row: usize,
+        columns: usize,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
         let mut values = vec![0.0; columns];
         self.matrix_row_into(tensor_index, row, &mut values)?;
         Ok(values)
@@ -1044,9 +1061,18 @@ impl<'a> TensorReader<'a> {
         output: &mut [f32],
     ) -> Result<(), Glm52CpuError> {
         let tensor = self.tensor(tensor_index)?;
-        require_rank(tensor, 2)?;
-        let rows = dimension(tensor, tensor.shape[0])?;
-        let columns = dimension(tensor, tensor.shape[1])?;
+        let (rows, columns, quantization) = if tensor.dtype == SafeDtype::U8 {
+            let (rows, quantization) =
+                infer_quantization(&self.source.index, tensor, output.len())?;
+            (rows, output.len(), Some(quantization))
+        } else {
+            require_rank(tensor, 2)?;
+            (
+                dimension(tensor, tensor.shape[0])?,
+                dimension(tensor, tensor.shape[1])?,
+                None,
+            )
+        };
         if row >= rows {
             return Err(Glm52CpuError::RowOutOfBounds {
                 tensor: tensor.name.clone(),
@@ -1061,25 +1087,37 @@ impl<'a> TensorReader<'a> {
                 actual: output.len(),
             });
         }
-        let offset = row
-            .checked_mul(columns)
-            .ok_or_else(|| Glm52CpuError::Overflow(tensor.name.clone()))?;
-        match tensor.dtype {
-            SafeDtype::F8E4M3 => self.read_fp8_row(tensor, row, output),
-            _ => self.read_dense_values(tensor, offset, output),
-        }?;
-        let row_bytes = u64::try_from(columns)
-            .ok()
-            .and_then(|columns| columns.checked_mul(tensor.dtype.byte_width()))
-            .unwrap_or(u64::MAX);
-        self.note_bytes(row_bytes);
+        if let Some(quantization) = quantization {
+            self.read_quantized_row(tensor, row, output, quantization)?;
+            let touched = quantization
+                .row_bytes(columns)
+                .saturating_add(quantization.scales_per_row(columns).saturating_mul(4));
+            self.note_bytes(u64::try_from(touched).unwrap_or(u64::MAX));
+        } else {
+            let offset = row
+                .checked_mul(columns)
+                .ok_or_else(|| Glm52CpuError::Overflow(tensor.name.clone()))?;
+            match tensor.dtype {
+                SafeDtype::F8E4M3 => self.read_fp8_row(tensor, row, output),
+                _ => self.read_dense_values(tensor, offset, output),
+            }?;
+            let row_bytes = u64::try_from(columns)
+                .ok()
+                .and_then(|columns| columns.checked_mul(tensor.dtype.byte_width()))
+                .unwrap_or(u64::MAX);
+            self.note_bytes(row_bytes);
+        }
         Ok(())
     }
 
     pub fn matvec(&self, tensor_index: usize, input: &[f32]) -> Result<Vec<f32>, Glm52CpuError> {
         let tensor = self.tensor(tensor_index)?;
-        require_rank(tensor, 2)?;
-        let rows = dimension(tensor, tensor.shape[0])?;
+        let rows = if tensor.dtype == SafeDtype::U8 {
+            infer_quantization(&self.source.index, tensor, input.len())?.0
+        } else {
+            require_rank(tensor, 2)?;
+            dimension(tensor, tensor.shape[0])?
+        };
         let mut output = vec![0.0; rows];
         self.matvec_into(tensor_index, input, &mut output)?;
         Ok(output)
@@ -1092,9 +1130,27 @@ impl<'a> TensorReader<'a> {
         output: &mut [f32],
     ) -> Result<(), Glm52CpuError> {
         let tensor = self.tensor(tensor_index)?;
-        require_rank(tensor, 2)?;
-        let rows = dimension(tensor, tensor.shape[0])?;
-        let columns = dimension(tensor, tensor.shape[1])?;
+        let quantization = if tensor.dtype == SafeDtype::U8 {
+            Some(resolve_quantization(
+                &self.source.index,
+                tensor,
+                u64::try_from(output.len())
+                    .map_err(|_| Glm52CpuError::Overflow(tensor.name.clone()))?,
+                u64::try_from(input.len())
+                    .map_err(|_| Glm52CpuError::Overflow(tensor.name.clone()))?,
+            )?)
+        } else {
+            require_rank(tensor, 2)?;
+            None
+        };
+        let (rows, columns) = if quantization.is_some() {
+            (output.len(), input.len())
+        } else {
+            (
+                dimension(tensor, tensor.shape[0])?,
+                dimension(tensor, tensor.shape[1])?,
+            )
+        };
         if input.len() != columns {
             return Err(Glm52CpuError::InputLength {
                 tensor: tensor.name.clone(),
@@ -1110,12 +1166,12 @@ impl<'a> TensorReader<'a> {
             });
         }
         self.note_bytes(tensor.byte_len);
-        if tensor.dtype == SafeDtype::F8E4M3
-            && let Some(scale) = self
-                .source
-                .index
-                .tensor(&format!("{}_scale_inv", tensor.name))
-        {
+        let scale_name = match tensor.dtype {
+            SafeDtype::F8E4M3 => Some(format!("{}_scale_inv", tensor.name)),
+            SafeDtype::U8 => Some(format!("{}.qs", tensor.name)),
+            _ => None,
+        };
+        if let Some(scale) = scale_name.and_then(|name| self.source.index.tensor(&name)) {
             self.note_bytes(scale.byte_len);
         }
         #[cfg(target_os = "macos")]
@@ -1141,6 +1197,10 @@ impl<'a> TensorReader<'a> {
         row: usize,
         output: &mut [f32],
     ) -> Result<(), Glm52CpuError> {
+        if tensor.dtype == SafeDtype::U8 {
+            let (_, quantization) = infer_quantization(&self.source.index, tensor, output.len())?;
+            return self.read_quantized_row(tensor, row, output, quantization);
+        }
         let columns = dimension(tensor, tensor.shape[1])?;
         let offset = row
             .checked_mul(columns)
@@ -1277,6 +1337,62 @@ impl<'a> TensorReader<'a> {
                     column,
                 })?;
             *output = decoded * scales[column / FP8_BLOCK];
+        }
+        Ok(())
+    }
+
+    fn read_quantized_row(
+        &self,
+        tensor: &SafeTensorInfo,
+        row: usize,
+        output: &mut [f32],
+        quantization: GlmQuantization,
+    ) -> Result<(), Glm52CpuError> {
+        let row_bytes = quantization.row_bytes(output.len());
+        let byte_offset = row
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Glm52CpuError::Overflow(tensor.name.clone()))?;
+        let mut encoded = vec![0_u8; row_bytes];
+        self.source.read_tensor_at(
+            &tensor.name,
+            u64::try_from(byte_offset).map_err(|_| Glm52CpuError::Overflow(tensor.name.clone()))?,
+            &mut encoded,
+        )?;
+
+        let scale_name = format!("{}.qs", tensor.name);
+        let scale_count = quantization.scales_per_row(output.len());
+        let scale_offset = row
+            .checked_mul(scale_count)
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| Glm52CpuError::Overflow(scale_name.clone()))?;
+        let mut scale_bytes = vec![0_u8; scale_count.saturating_mul(4)];
+        self.source.read_tensor_at(
+            &scale_name,
+            u64::try_from(scale_offset).map_err(|_| Glm52CpuError::Overflow(scale_name.clone()))?,
+            &mut scale_bytes,
+        )?;
+        let scales = scale_bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .collect::<Vec<_>>();
+
+        match quantization {
+            GlmQuantization::Int8Row => {
+                for (value, encoded) in output.iter_mut().zip(encoded) {
+                    *value = f32::from(encoded as i8) * scales[0];
+                }
+            }
+            GlmQuantization::Int4Grouped { group_size } => {
+                for (column, value) in output.iter_mut().enumerate() {
+                    let byte = encoded[column / 2];
+                    let nibble = if column.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    *value = (f32::from(nibble) - 8.0) * scales[column / group_size];
+                }
+            }
         }
         Ok(())
     }
@@ -1436,6 +1552,58 @@ mod tests {
     }
 
     #[test]
+    fn reads_flat_row_int8_and_grouped_int4_matrices() {
+        let temp = TempDir::new().unwrap();
+        let int8_scales = [0.1_f32, 0.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let int4_scales = [0.5_f32, 2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        write_safetensors(
+            &temp.path().join("model.safetensors"),
+            &[
+                (
+                    "int8",
+                    "U8",
+                    vec![6],
+                    vec![(-127_i8) as u8, 0, 127, (-2_i8) as u8, 3, 4],
+                ),
+                ("int8.qs", "F32", vec![2], int8_scales),
+                (
+                    "int4",
+                    "U8",
+                    vec![6],
+                    vec![0x40, 0xc8, 0x0f, 0xa9, 0xcb, 0x0d],
+                ),
+                ("int4.qs", "F32", vec![2], int4_scales),
+            ],
+        );
+        let source = SafeTensorSource::open(temp.path()).unwrap();
+        let reader = TensorReader::new(&source);
+
+        let int8 = tensor_index(&source, "int8");
+        assert_eq!(
+            reader.matvec(int8, &[1.0, 2.0, -1.0]).unwrap(),
+            [-25.4, 0.0]
+        );
+        let mut int8_row = [0.0; 3];
+        reader.matrix_row_into(int8, 1, &mut int8_row).unwrap();
+        assert_eq!(int8_row, [-1.0, 1.5, 2.0]);
+
+        let int4 = tensor_index(&source, "int4");
+        assert_eq!(
+            reader.matvec(int4, &[1.0, 1.0, 1.0, 1.0, 1.0]).unwrap(),
+            [-0.5, 30.0]
+        );
+        let mut int4_row = [0.0; 5];
+        reader.matrix_row_into(int4, 0, &mut int4_row).unwrap();
+        assert_eq!(int4_row, [-4.0, -2.0, 0.0, 2.0, 3.5]);
+    }
+
+    #[test]
     fn rotates_adjacent_pairs_into_contiguous_halves() {
         let mut values = [1.0, 2.0, 3.0, 4.0];
         rope_interleaved_prefix(&mut values, 4, 1, 100.0);
@@ -1484,6 +1652,34 @@ mod tests {
             replay_logits = model.forward_token(&mut replay, token, &cancelled).unwrap();
         }
         assert_eq!(final_logits, replay_logits);
+    }
+
+    #[test]
+    fn grouped_int4_graph_matches_its_dequantized_cpu_reference() {
+        let quantized_directory = TempDir::new().unwrap();
+        let reference_directory = TempDir::new().unwrap();
+        write_tiny_quantized_pair(quantized_directory.path(), reference_directory.path());
+        let quantized = Glm52CpuModel::from_directory(quantized_directory.path()).unwrap();
+        let reference = Glm52CpuModel::from_directory(reference_directory.path()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut quantized_session = quantized.start_session(8);
+        let mut reference_session = reference.start_session(8);
+
+        for token in [1, 2, 3, 4] {
+            let actual = quantized
+                .forward_token(&mut quantized_session, token, &cancelled)
+                .unwrap();
+            let expected = reference
+                .forward_token(&mut reference_session, token, &cancelled)
+                .unwrap();
+            assert_eq!(argmax(&actual), argmax(&expected));
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+            }
+        }
+        let stats = quantized.expert_cache_stats().unwrap();
+        assert!(stats.misses > 0);
+        assert!(stats.bytes_read > 0);
     }
 
     #[cfg(target_os = "macos")]
@@ -1797,6 +1993,131 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
+    }
+
+    fn write_tiny_quantized_pair(quantized_directory: &Path, reference_directory: &Path) {
+        write_tiny_model(quantized_directory);
+        write_tiny_model(reference_directory);
+        let source = SafeTensorSource::open(quantized_directory).unwrap();
+        let mut quantized = Vec::new();
+        let mut reference = Vec::new();
+        for tensor in source.index.tensors() {
+            let mut bytes = vec![0_u8; tensor.byte_len as usize];
+            source.read_tensor_at(&tensor.name, 0, &mut bytes).unwrap();
+            let is_matrix = tensor.shape.len() == 2;
+            let is_router = tensor.name.ends_with(".mlp.gate.weight");
+            if !is_matrix || is_router {
+                quantized.push((
+                    tensor.name.clone(),
+                    "F32",
+                    tensor.shape.clone(),
+                    bytes.clone(),
+                ));
+                reference.push((tensor.name.clone(), "F32", tensor.shape.clone(), bytes));
+                continue;
+            }
+            let values = bytes
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let rows = tensor.shape[0] as usize;
+            let columns = tensor.shape[1] as usize;
+            let int8 = matches!(
+                tensor.name.as_str(),
+                "model.embed_tokens.weight" | "lm_head.weight"
+            );
+            let (encoded, scales, dequantized) = if int8 {
+                quantize_rows(&values, rows, columns, 127, None)
+            } else {
+                quantize_rows(&values, rows, columns, 7, Some(16))
+            };
+            quantized.push((
+                tensor.name.clone(),
+                "U8",
+                vec![encoded.len() as u64],
+                encoded,
+            ));
+            quantized.push((
+                format!("{}.qs", tensor.name),
+                "F32",
+                vec![scales.len() as u64],
+                scales
+                    .iter()
+                    .flat_map(|scale| scale.to_le_bytes())
+                    .collect(),
+            ));
+            reference.push((
+                tensor.name.clone(),
+                "F32",
+                tensor.shape.clone(),
+                dequantized.into_iter().flat_map(f32::to_le_bytes).collect(),
+            ));
+        }
+        drop(source);
+        write_owned_safetensors(&quantized_directory.join("model.safetensors"), &quantized);
+        write_owned_safetensors(&reference_directory.join("model.safetensors"), &reference);
+    }
+
+    fn quantize_rows(
+        values: &[f32],
+        rows: usize,
+        columns: usize,
+        maximum: i8,
+        group_size: Option<usize>,
+    ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let group_size = group_size.unwrap_or(columns);
+        let groups = columns.div_ceil(group_size);
+        let mut integers = vec![0_i8; values.len()];
+        let mut scales = Vec::with_capacity(rows * groups);
+        let mut dequantized = vec![0.0; values.len()];
+        for row in 0..rows {
+            for group in 0..groups {
+                let start = row * columns + group * group_size;
+                let end = (start + group_size).min((row + 1) * columns);
+                let scale = (values[start..end]
+                    .iter()
+                    .fold(0.0_f32, |maximum, value| maximum.max(value.abs()))
+                    / f32::from(maximum))
+                .max(1e-8);
+                scales.push(scale);
+                for index in start..end {
+                    let integer = (values[index] / scale)
+                        .round()
+                        .clamp(f32::from(-maximum - 1), f32::from(maximum))
+                        as i8;
+                    integers[index] = integer;
+                    dequantized[index] = f32::from(integer) * scale;
+                }
+            }
+        }
+        let encoded = if maximum == 127 {
+            integers.into_iter().map(|value| value as u8).collect()
+        } else {
+            let mut encoded = vec![0_u8; rows * columns.div_ceil(2)];
+            for row in 0..rows {
+                for column in 0..columns {
+                    let nibble = (integers[row * columns + column] + 8) as u8;
+                    let target = &mut encoded[row * columns.div_ceil(2) + column / 2];
+                    if column.is_multiple_of(2) {
+                        *target = nibble;
+                    } else {
+                        *target |= nibble << 4;
+                    }
+                }
+            }
+            encoded
+        };
+        (encoded, scales, dequantized)
+    }
+
+    fn write_owned_safetensors(path: &Path, tensors: &[(String, &str, Vec<u64>, Vec<u8>)]) {
+        let borrowed = tensors
+            .iter()
+            .map(|(name, dtype, shape, bytes)| {
+                (name.as_str(), *dtype, shape.clone(), bytes.clone())
+            })
+            .collect::<Vec<_>>();
+        write_safetensors(path, &borrowed);
     }
 
     fn add_tensor(tensors: &mut Vec<(String, Vec<u64>)>, name: &str, shape: &[u64]) {
