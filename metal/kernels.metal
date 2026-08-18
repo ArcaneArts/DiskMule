@@ -1,6 +1,25 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float load_f16(device const uchar *bytes) {
+    const ushort bits = ushort(bytes[0]) | (ushort(bytes[1]) << 8);
+    return float(as_type<half>(bits));
+}
+
+inline uint q4_k_scale(device const uchar *scales, uint index) {
+    if (index < 4) {
+        return uint(scales[index] & 0x3f);
+    }
+    return uint((scales[index + 4] & 0x0f) | ((scales[index - 4] >> 6) << 4));
+}
+
+inline uint q4_k_minimum(device const uchar *scales, uint index) {
+    if (index < 4) {
+        return uint(scales[index + 4] & 0x3f);
+    }
+    return uint((scales[index + 4] >> 4) | ((scales[index] >> 6) << 4));
+}
+
 kernel void vector_add(
     device const float *left [[buffer(0)]],
     device const float *right [[buffer(1)]],
@@ -138,7 +157,7 @@ kernel void deterministic_argmax(
     threadgroup float values[256];
     threadgroup uint indices[256];
     float best_value = -INFINITY;
-    uint best_index = UINT_MAX;
+    uint best_index = 0xffffffffu;
     for (uint index = lane; index < count; index += lanes) {
         const float candidate = input[index];
         if (candidate > best_value || (candidate == best_value && index < best_index)) {
@@ -164,4 +183,174 @@ kernel void deterministic_argmax(
     if (lane == 0) {
         output[0] = indices[0];
     }
+}
+
+kernel void matvec_f32(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const float *weights = (device const float *)(encoded + row * row_bytes);
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        sum = fma(weights[column], input[column], sum);
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_f16(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const half *weights = (device const half *)(encoded + row * row_bytes);
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        sum = fma(float(weights[column]), input[column], sum);
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_q5_0(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *row_data = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint block_index = 0; block_index < columns / 32; block_index++) {
+        device const uchar *block = row_data + block_index * 22;
+        const float delta = load_f16(block);
+        const uint high_bits = uint(block[2]) | (uint(block[3]) << 8)
+            | (uint(block[4]) << 16) | (uint(block[5]) << 24);
+        const uint base = block_index * 32;
+        for (uint index = 0; index < 16; index++) {
+            const uchar packed = block[6 + index];
+            const uint low_high_bit = ((high_bits >> index) << 4) & 0x10;
+            const int low = int((uint(packed) & 0x0f) | low_high_bit) - 16;
+            sum = fma(delta * float(low), input[base + index], sum);
+        }
+        for (uint index = 0; index < 16; index++) {
+            const uchar packed = block[6 + index];
+            const uint high_high_bit = (high_bits >> (index + 12)) & 0x10;
+            const int high = int((uint(packed) >> 4) | high_high_bit) - 16;
+            sum = fma(delta * float(high), input[base + index + 16], sum);
+        }
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_q8_0(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *row_data = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint block_index = 0; block_index < columns / 32; block_index++) {
+        device const uchar *block = row_data + block_index * 34;
+        const float delta = load_f16(block);
+        const uint base = block_index * 32;
+        for (uint index = 0; index < 32; index++) {
+            const char quant = as_type<char>(block[2 + index]);
+            sum = fma(delta * float(quant), input[base + index], sum);
+        }
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_q4_k(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *row_data = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint block_index = 0; block_index < columns / 256; block_index++) {
+        device const uchar *block = row_data + block_index * 144;
+        const float delta = load_f16(block);
+        const float minimum = load_f16(block + 2);
+        device const uchar *scales = block + 4;
+        device const uchar *quants = block + 16;
+        const uint block_base = block_index * 256;
+        for (uint group_pair = 0; group_pair < 4; group_pair++) {
+            const float scale_low = delta * float(q4_k_scale(scales, group_pair * 2));
+            const float min_low = minimum * float(q4_k_minimum(scales, group_pair * 2));
+            const float scale_high = delta * float(q4_k_scale(scales, group_pair * 2 + 1));
+            const float min_high = minimum * float(q4_k_minimum(scales, group_pair * 2 + 1));
+            const uint quant_offset = group_pair * 32;
+            const uint value_offset = block_base + group_pair * 64;
+            for (uint index = 0; index < 32; index++) {
+                const uchar packed = quants[quant_offset + index];
+                const float low = scale_low * float(packed & 0x0f) - min_low;
+                sum = fma(low, input[value_offset + index], sum);
+            }
+            for (uint index = 0; index < 32; index++) {
+                const uchar packed = quants[quant_offset + index];
+                const float high = scale_high * float(packed >> 4) - min_high;
+                sum = fma(high, input[value_offset + index + 32], sum);
+            }
+        }
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_q6_k(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *row_data = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint block_index = 0; block_index < columns / 256; block_index++) {
+        device const uchar *block = row_data + block_index * 210;
+        const float delta = load_f16(block + 208);
+        const uint block_base = block_index * 256;
+        for (uint half_index = 0; half_index < 2; half_index++) {
+            device const uchar *low = block + half_index * 64;
+            device const uchar *high = block + 128 + half_index * 32;
+            device const uchar *scales = block + 192 + half_index * 8;
+            const uint half_base = block_base + half_index * 128;
+            for (uint index = 0; index < 32; index++) {
+                const uint scale_pair = index / 16;
+                const uint q1 = uint(low[index] & 0x0f) | (uint(high[index] & 0x03) << 4);
+                const float scale1 = delta * float(as_type<char>(scales[scale_pair]));
+                sum = fma(scale1 * (float(q1) - 32.0f), input[half_base + index], sum);
+            }
+            for (uint index = 0; index < 32; index++) {
+                const uint scale_pair = index / 16;
+                const uint q2 = uint(low[index + 32] & 0x0f)
+                    | (uint((high[index] >> 2) & 0x03) << 4);
+                const float scale2 = delta * float(as_type<char>(scales[scale_pair + 2]));
+                sum = fma(scale2 * (float(q2) - 32.0f), input[half_base + index + 32], sum);
+            }
+            for (uint index = 0; index < 32; index++) {
+                const uint scale_pair = index / 16;
+                const uint q3 = uint(low[index] >> 4)
+                    | (uint((high[index] >> 4) & 0x03) << 4);
+                const float scale3 = delta * float(as_type<char>(scales[scale_pair + 4]));
+                sum = fma(scale3 * (float(q3) - 32.0f), input[half_base + index + 64], sum);
+            }
+            for (uint index = 0; index < 32; index++) {
+                const uint scale_pair = index / 16;
+                const uint q4 = uint(low[index + 32] >> 4)
+                    | (uint((high[index] >> 6) & 0x03) << 4);
+                const float scale4 = delta * float(as_type<char>(scales[scale_pair + 6]));
+                sum = fma(scale4 * (float(q4) - 32.0f), input[half_base + index + 96], sum);
+            }
+        }
+    }
+    output[row] = sum;
 }

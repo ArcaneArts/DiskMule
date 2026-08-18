@@ -65,6 +65,34 @@ pub enum MetalError {
     #[error("{operation} received a non-finite value")]
     NonFinite { operation: &'static str },
 
+    #[error("Metal matrix-vector multiplication does not support {0}")]
+    UnsupportedTensorType(&'static str),
+
+    #[error(
+        "{kind} output length {elements} is not divisible by its {block_elements}-element block"
+    )]
+    InvalidElementCount {
+        kind: &'static str,
+        elements: usize,
+        block_elements: u64,
+    },
+
+    #[error("{kind} requires {expected} encoded bytes, got {actual}")]
+    InvalidByteLength {
+        kind: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("matrix dimensions or encoded byte length overflowed")]
+    Overflow,
+
+    #[error("matvec input has {actual} columns; expected {expected}")]
+    InvalidInputLength { expected: usize, actual: usize },
+
+    #[error("matvec output has {actual} rows; expected {expected}")]
+    InvalidOutputLength { expected: usize, actual: usize },
+
     #[error("could not create a Metal command buffer or compute encoder")]
     CommandEncoding,
 
@@ -91,6 +119,7 @@ mod implementation {
     };
 
     use super::MetalError;
+    use crate::gguf::TensorType;
 
     const SHADERS: &str = include_str!("../metal/kernels.metal");
     const VECTOR_ADD: &str = "vector_add";
@@ -100,6 +129,12 @@ mod implementation {
     const STABLE_SOFTMAX: &str = "stable_softmax";
     const LOGIT_SOFTCAP: &str = "logit_softcap";
     const DETERMINISTIC_ARGMAX: &str = "deterministic_argmax";
+    const MATVEC_F32: &str = "matvec_f32";
+    const MATVEC_F16: &str = "matvec_f16";
+    const MATVEC_Q5_0: &str = "matvec_q5_0";
+    const MATVEC_Q8_0: &str = "matvec_q8_0";
+    const MATVEC_Q4_K: &str = "matvec_q4_k";
+    const MATVEC_Q6_K: &str = "matvec_q6_k";
     const REDUCTION_THREADS: usize = 256;
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -116,6 +151,12 @@ mod implementation {
         stable_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         logit_softcap: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         deterministic_argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_q5_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_q4_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_q6_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     impl MetalContext {
@@ -133,6 +174,12 @@ mod implementation {
             let stable_softmax = pipeline(&device, &library, STABLE_SOFTMAX)?;
             let logit_softcap = pipeline(&device, &library, LOGIT_SOFTCAP)?;
             let deterministic_argmax = pipeline(&device, &library, DETERMINISTIC_ARGMAX)?;
+            let matvec_f32 = pipeline(&device, &library, MATVEC_F32)?;
+            let matvec_f16 = pipeline(&device, &library, MATVEC_F16)?;
+            let matvec_q5_0 = pipeline(&device, &library, MATVEC_Q5_0)?;
+            let matvec_q8_0 = pipeline(&device, &library, MATVEC_Q8_0)?;
+            let matvec_q4_k = pipeline(&device, &library, MATVEC_Q4_K)?;
+            let matvec_q6_k = pipeline(&device, &library, MATVEC_Q6_K)?;
             Ok(Self {
                 device,
                 queue,
@@ -143,6 +190,12 @@ mod implementation {
                 stable_softmax,
                 logit_softcap,
                 deterministic_argmax,
+                matvec_f32,
+                matvec_f16,
+                matvec_q5_0,
+                matvec_q8_0,
+                matvec_q4_k,
+                matvec_q6_k,
             })
         }
 
@@ -368,6 +421,80 @@ mod implementation {
             Ok(output[0] as usize)
         }
 
+        /// Multiply a row-major GGUF matrix by one FP32 vector without
+        /// dequantizing the matrix on the CPU.
+        pub fn matvec(
+            &self,
+            kind: TensorType,
+            rows: usize,
+            columns: usize,
+            encoded: &[u8],
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let pipeline = match kind {
+                TensorType::F32 => &self.matvec_f32,
+                TensorType::F16 => &self.matvec_f16,
+                TensorType::Q5_0 => &self.matvec_q5_0,
+                TensorType::Q8_0 => &self.matvec_q8_0,
+                TensorType::Q4K => &self.matvec_q4_k,
+                TensorType::Q6K => &self.matvec_q6_k,
+                _ => return Err(MetalError::UnsupportedTensorType(kind.name())),
+            };
+            let row_bytes = kind
+                .row_byte_len(u64::try_from(columns).map_err(|_| MetalError::Overflow)?)
+                .ok_or(MetalError::InvalidElementCount {
+                    kind: kind.name(),
+                    elements: columns,
+                    block_elements: kind.block_elements(),
+                })?;
+            let row_bytes = usize::try_from(row_bytes).map_err(|_| MetalError::Overflow)?;
+            let matrix_bytes = rows.checked_mul(row_bytes).ok_or(MetalError::Overflow)?;
+            if encoded.len() != matrix_bytes {
+                return Err(MetalError::InvalidByteLength {
+                    kind: kind.name(),
+                    expected: matrix_bytes,
+                    actual: encoded.len(),
+                });
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("matvec", input)?;
+
+            let encoded_buffer = self.buffer_with_data(encoded)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            let row_bytes_buffer = self.buffer_with_data(&[count_u32(row_bytes)?])?;
+            self.execute(
+                pipeline,
+                &[
+                    &encoded_buffer,
+                    &input_buffer,
+                    &output_buffer,
+                    &columns_buffer,
+                    &row_bytes_buffer,
+                ],
+                rows,
+                rows.min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
         fn execute(
             &self,
             pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -559,7 +686,7 @@ mod implementation {
     mod tests {
         use objc2_metal::MTLBuffer;
 
-        use crate::cpu;
+        use crate::{cpu, gguf::TensorType};
 
         use super::MetalContext;
 
@@ -570,6 +697,92 @@ mod implementation {
                     (actual - expected).abs() <= tolerance,
                     "index {index}: Metal {actual} differs from CPU {expected} by more than {tolerance}"
                 );
+            }
+        }
+
+        fn assert_close_relative(actual: &[f32], expected: &[f32]) {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                let tolerance = 5.0e-4_f32.max(expected.abs() * 2.0e-5);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "index {index}: Metal {actual} differs from CPU {expected} by more than {tolerance}"
+                );
+            }
+        }
+
+        fn matvec_fixture(kind: TensorType, rows: usize) -> (usize, Vec<u8>) {
+            match kind {
+                TensorType::F32 => {
+                    let columns = 64;
+                    let encoded = (0..rows * columns)
+                        .flat_map(|index| {
+                            (((index * 17) % 41) as f32 * 0.03125 - 0.625).to_le_bytes()
+                        })
+                        .collect();
+                    (columns, encoded)
+                }
+                TensorType::F16 => {
+                    let columns = 64;
+                    let patterns = [0x3000_u16, 0xb400, 0x3800, 0xbc00, 0x3c00, 0x4000];
+                    let encoded = (0..rows * columns)
+                        .flat_map(|index| patterns[index % patterns.len()].to_le_bytes())
+                        .collect();
+                    (columns, encoded)
+                }
+                TensorType::Q5_0 => {
+                    let mut encoded = Vec::with_capacity(rows * 22);
+                    for row in 0..rows {
+                        let mut block = [0_u8; 22];
+                        block[..2].copy_from_slice(&0x3400_u16.to_le_bytes());
+                        for (index, value) in block[2..].iter_mut().enumerate() {
+                            *value = (index * 29 + row * 47 + 3) as u8;
+                        }
+                        encoded.extend_from_slice(&block);
+                    }
+                    (32, encoded)
+                }
+                TensorType::Q8_0 => {
+                    let mut encoded = Vec::with_capacity(rows * 34);
+                    for row in 0..rows {
+                        let mut block = [0_u8; 34];
+                        block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+                        for (index, value) in block[2..].iter_mut().enumerate() {
+                            *value = (index as i16 * 7 - 101 + row as i16 * 11) as i8 as u8;
+                        }
+                        encoded.extend_from_slice(&block);
+                    }
+                    (32, encoded)
+                }
+                TensorType::Q4K => {
+                    let mut encoded = Vec::with_capacity(rows * 144);
+                    for row in 0..rows {
+                        let mut block = [0_u8; 144];
+                        block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+                        block[2..4].copy_from_slice(&0x2800_u16.to_le_bytes());
+                        for (index, value) in block[4..].iter_mut().enumerate() {
+                            *value = (index * 19 + row * 31 + 5) as u8;
+                        }
+                        encoded.extend_from_slice(&block);
+                    }
+                    (256, encoded)
+                }
+                TensorType::Q6K => {
+                    let mut encoded = Vec::with_capacity(rows * 210);
+                    for row in 0..rows {
+                        let mut block = [0_u8; 210];
+                        for (index, value) in block[..192].iter_mut().enumerate() {
+                            *value = (index * 23 + row * 37 + 11) as u8;
+                        }
+                        for (index, value) in block[192..208].iter_mut().enumerate() {
+                            *value = (index as i8 * 5 - 37 + row as i8 * 3) as u8;
+                        }
+                        block[208..].copy_from_slice(&0x2800_u16.to_le_bytes());
+                        encoded.extend_from_slice(&block);
+                    }
+                    (256, encoded)
+                }
+                _ => unreachable!("fixture only covers Metal-supported tensor types"),
             }
         }
 
@@ -648,6 +861,32 @@ mod implementation {
                 context.argmax(&logits).unwrap(),
                 cpu::argmax(&logits).unwrap()
             );
+        }
+
+        #[test]
+        fn encoded_matvec_kernels_match_the_cpu_reference() {
+            let context = MetalContext::new().unwrap();
+            for kind in [
+                TensorType::F32,
+                TensorType::F16,
+                TensorType::Q5_0,
+                TensorType::Q8_0,
+                TensorType::Q4K,
+                TensorType::Q6K,
+            ] {
+                let rows = 3;
+                let (columns, encoded) = matvec_fixture(kind, rows);
+                let input: Vec<_> = (0..columns)
+                    .map(|index| ((index * 11 % 53) as f32 - 26.0) * 0.0078125)
+                    .collect();
+                let mut expected = vec![0.0; rows];
+                cpu::matvec(kind, rows, columns, &encoded, &input, &mut expected).unwrap();
+                let mut actual = vec![0.0; rows];
+                context
+                    .matvec(kind, rows, columns, &encoded, &input, &mut actual)
+                    .unwrap();
+                assert_close_relative(&actual, &expected);
+            }
         }
     }
 }
