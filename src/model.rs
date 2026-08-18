@@ -50,6 +50,9 @@ pub enum ModelError {
     #[error("model {0:?} is currently loaded and cannot be removed")]
     Loaded(String),
 
+    #[error("model {name:?} cannot be run: {status}")]
+    NotRunnable { name: String, status: String },
+
     #[error("model {name:?} has an unsafe managed path: {reason}")]
     UnsafeManagedPath { name: String, reason: String },
 
@@ -64,6 +67,7 @@ pub enum ModelError {
 pub enum ModelSource {
     DiskMule,
     Ollama,
+    LocalFile,
 }
 
 impl fmt::Display for ModelSource {
@@ -71,6 +75,7 @@ impl fmt::Display for ModelSource {
         formatter.write_str(match self {
             Self::DiskMule => "diskmule",
             Self::Ollama => "ollama (read-only)",
+            Self::LocalFile => "local file (read-only)",
         })
     }
 }
@@ -109,6 +114,15 @@ pub struct ModelRecord {
     pub size: Option<u64>,
     pub source: ModelSource,
     pub compatibility: Compatibility,
+    pub gguf: Option<GgufSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgufSummary {
+    pub version: u32,
+    pub alignment: u32,
+    pub data_offset: u64,
+    pub tensor_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +223,29 @@ impl ModelCatalog {
                 name: name.to_owned(),
                 matches: matches.len(),
             }),
+        }
+    }
+
+    pub fn resolve_for_run(&self, input: &str) -> Result<ModelRecord, ModelError> {
+        match self.resolve(input) {
+            Ok(record) => Ok(record.clone()),
+            Err(ModelError::NotFound(_)) => {
+                let path = PathBuf::from(input);
+                if !path.is_file() {
+                    return Err(ModelError::NotFound(input.to_owned()));
+                }
+                let canonical = fs::canonicalize(&path).map_err(|source| ModelError::Read {
+                    path: path.clone(),
+                    source,
+                })?;
+                Ok(inspect_model(
+                    input.to_owned(),
+                    canonical,
+                    ModelSource::LocalFile,
+                    None,
+                ))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -353,6 +390,7 @@ fn inspect_managed_entry(root: &Path, entry: &ManagedEntry) -> ModelRecord {
             size: None,
             source: ModelSource::DiskMule,
             compatibility: Compatibility::Invalid(error.to_string()),
+            gguf: None,
         },
     }
 }
@@ -453,6 +491,7 @@ fn inspect_ollama_manifest(root: &Path, name: String, manifest_path: &Path) -> M
             size: None,
             source: ModelSource::Ollama,
             compatibility: Compatibility::Invalid(error.to_string()),
+            gguf: None,
         },
     }
 }
@@ -483,6 +522,12 @@ fn inspect_model(
                 size: actual_size.or(declared_size),
                 source,
                 compatibility,
+                gguf: Some(GgufSummary {
+                    version: gguf.version,
+                    alignment: gguf.alignment,
+                    data_offset: gguf.data_offset,
+                    tensor_count: gguf.tensors.len(),
+                }),
             }
         }
         Err(error) => ModelRecord {
@@ -493,6 +538,7 @@ fn inspect_model(
             size: actual_size.or(declared_size),
             source,
             compatibility: Compatibility::Invalid(error.to_string()),
+            gguf: None,
         },
     }
 }
@@ -613,6 +659,7 @@ fn source_rank(source: ModelSource) -> u8 {
     match source {
         ModelSource::DiskMule => 0,
         ModelSource::Ollama => 1,
+        ModelSource::LocalFile => 2,
     }
 }
 
@@ -694,6 +741,21 @@ mod tests {
                 .unwrap()
                 .starts_with(ollama.join("blobs"))
         );
+    }
+
+    #[test]
+    fn resolves_a_direct_local_file_as_read_only() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::from_root(temp.path().join("diskmule"));
+        let local = temp.path().join("direct.gguf");
+        write_fixture(&local);
+
+        let catalog = ModelCatalog::discover(&paths, None).unwrap();
+        let record = catalog.resolve_for_run(local.to_str().unwrap()).unwrap();
+        assert_eq!(record.source, ModelSource::LocalFile);
+        assert_eq!(record.path, Some(fs::canonicalize(local).unwrap()));
+        assert_eq!(record.architecture.as_deref(), Some("gemma4"));
+        assert!(record.compatibility.is_metadata_compatible());
     }
 
     #[test]

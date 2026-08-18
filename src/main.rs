@@ -3,7 +3,8 @@ use std::{io, process::ExitCode};
 use clap::Parser;
 use diskmule::{cli::Cli, config::Paths};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     diskmule::init_logging();
 
     let cli = Cli::parse();
@@ -15,7 +16,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match diskmule::execute(&cli, &paths, &mut io::stdout().lock()) {
+    match diskmule::execute(&cli, &paths, &mut io::stdout().lock()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");

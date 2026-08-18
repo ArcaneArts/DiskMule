@@ -28,6 +28,9 @@ pub enum AppError {
 
     #[error(transparent)]
     Model(#[from] crate::model::ModelError),
+
+    #[error(transparent)]
+    Server(#[from] crate::server::ServerError),
 }
 
 impl AppError {
@@ -41,6 +44,7 @@ impl AppError {
             }
             Self::Gguf(_) => ExitCode::FAILURE,
             Self::Model(_) => ExitCode::FAILURE,
+            Self::Server(_) => ExitCode::FAILURE,
         }
     }
 }
