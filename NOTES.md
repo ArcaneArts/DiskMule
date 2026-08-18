@@ -158,6 +158,31 @@ one-slot streaming produced a 380.2 ms TTFT and about 2.80 decode tokens/s,
 with zero resident/streamed logit error. These are warm local measurements, not
 SSD or cross-machine claims.
 
+## Shared runtime and server findings
+
+Metal model objects remain on dedicated owning threads. CLI and HTTP requests
+reach them through the same bounded synchronous request queue and bounded token
+channel; an HTTP body or terminal turn dropping its generation ticket flips the
+same cancellation flag checked by the graph and expert reader. Model count,
+context, queue capacity, buffered token events, and per-model sessions all have
+validated upper bounds.
+
+Persistent CPU and Metal sessions compare the next rendered prompt with the
+exact cached token IDs and reuse only the common prefix. A changed prompt
+truncates every KV layer to the same prefix. Failed and cancelled turns roll
+back to the last stable prefix. The final un-forwarded output token is simply
+re-evaluated on the next turn, avoiding a hidden extra decode. Session capacity
+uses deterministic LRU eviction; because clients retain complete message
+history, eviction changes performance rather than prompt semantics. The pinned
+Metal oracle split the four-token BOS fixture across two session calls, reused
+two prompt tokens on the second call, and matched the stateless IDs exactly.
+
+The real HTTP oracle sends simultaneous streaming and non-streaming Gemma
+requests, drops a streaming connection, verifies a successful recovery request,
+checks loaded-model status, and confirms graceful shutdown joins the model
+worker. The server remains loopback-only by default; a non-loopback bind must be
+an explicit `DISKMULE_BIND` configuration.
+
 Colibri already has a learned hot store (`PIN=auto`, `PIN_GB`, `AUTOPIN`) and per-layer cache slots. On macOS it can `mlock` the application-owned cache so the memory compressor does not unexpectedly reclaim/compress the hot working set.
 
 Compare buffered reads with `DIRECT=1`. On macOS, Colibri maps the direct setting to `F_NOCACHE`. Direct I/O gives the application more control and can avoid duplicate file-cache residency, but performance is SSD- and workload-dependent. Measure both paths instead of assuming direct I/O always wins.

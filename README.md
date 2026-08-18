@@ -10,7 +10,9 @@ deterministic Gemma 4 26B CPU and Metal paths. It can inspect and map GGUF
 tensors, discover local Ollama models without copying them, safely manage
 DiskMule-owned entries, run streaming terminal chat, retain bounded Metal KV
 state, and force routed experts through an explicit storage-backed cache. The
-shared CLI/server generation surface is the next active phase.
+CLI and Ollama-compatible HTTP server share bounded model workers, persistent
+KV sessions, deterministic sampling, streaming, and cancellation. GLM-5.2
+format and architecture support is the next active phase.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
 for the Colibri and TurboFieldfare research behind it.
@@ -49,15 +51,17 @@ diskmule run /path/to/model.gguf
 
 `run` prints the resolved model details and starts an EOF-safe terminal loop.
 Enter `/clear` to reset history, `/help` for local commands, or `/bye` to exit.
-Generation is greedy and streams through DiskMule's own Metal runtime by
-default on macOS. Other platforms and `DISKMULE_BACKEND=cpu` use the explicit
-CPU correctness fallback. `DISKMULE_EXPERT_SLOTS` forces routed experts through
-that many storage-backed slots per layer; leaving it unset uses the retained
-GGUF mapping. Temporary development controls bound generation while the richer
-Phase 5 CLI surface is being built:
+Generation streams through DiskMule's own Metal runtime by default on macOS.
+Other platforms and `DISKMULE_BACKEND=cpu` use the explicit CPU correctness
+fallback. Ctrl-C cancels an in-flight turn and returns to the prompt. Sampling
+defaults to deterministic greedy decoding; temperature, top-k, top-p, and seed
+are independently configurable. `DISKMULE_EXPERT_SLOTS` forces routed experts
+through that many storage-backed slots per layer; leaving it unset uses the
+retained GGUF mapping:
 
 ```bash
 DISKMULE_CONTEXT=4096 DISKMULE_MAX_TOKENS=64 diskmule run gemma4:26b
+DISKMULE_TEMPERATURE=0.8 DISKMULE_TOP_K=40 DISKMULE_TOP_P=0.9 DISKMULE_SEED=42 diskmule run gemma4:26b
 DISKMULE_BACKEND=cpu diskmule run gemma4:26b
 DISKMULE_EXPERT_SLOTS=4 diskmule run gemma4:26b
 ```
@@ -81,15 +85,34 @@ diskmule --serve
 curl http://127.0.0.1:11435/health
 ```
 
-The first-pass server binds only to `127.0.0.1:11435`, one port above Ollama's
-usual local port, and currently exposes:
+The server binds to `127.0.0.1:11435`, one port above Ollama's usual local port,
+unless `DISKMULE_BIND` explicitly selects another socket. It exposes:
 
 ```text
 GET /health
+GET /api/loaded
+POST /api/chat
 ```
 
-It returns JSON containing the health status, service name, and DiskMule
-version. Ctrl-C and SIGTERM trigger graceful shutdown.
+`POST /api/chat` accepts the Ollama chat request shape. Streaming is the
+default and returns newline-delimited JSON; set `"stream": false` for one JSON
+response. The optional DiskMule extension `"session": "client-id"` retains and
+validates KV prefixes across calls. Clients still send the complete message
+history, so an evicted session is reconstructed without changing semantics:
+
+```bash
+curl -N http://127.0.0.1:11435/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemma4:26b","session":"demo","messages":[{"role":"user","content":"Hello"}],"options":{"temperature":0,"num_predict":32}}'
+```
+
+The service bounds model count, request queues, token buffers, sessions, and
+context with `DISKMULE_MAX_MODELS`, `DISKMULE_REQUEST_QUEUE`,
+`DISKMULE_TOKEN_BUFFER`, `DISKMULE_MAX_SESSIONS`, and `DISKMULE_CONTEXT`.
+Defaults are one loaded model, eight queued requests, 32 buffered token events,
+two sessions per model, and a 4096-token context. Session eviction is a
+deterministic LRU. Disconnects cancel generation, and Ctrl-C or SIGTERM drains
+the HTTP server and joins model-owning worker threads.
 
 ## Model locations and ownership
 
@@ -178,6 +201,7 @@ The expensive pinned correctness oracle is separate from the fast gate:
 ```bash
 cargo test --release --test gemma4_cpu_reference -- --ignored --nocapture
 cargo test --release --test gemma4_metal_reference -- --ignored --nocapture
+cargo test --release --test gemma4_server_reference -- --ignored --nocapture
 ```
 
 For GGUF digest
@@ -187,5 +211,8 @@ token IDs match exactly (`47610, 1852, 2624, 1852`), and the first token's
 normalized log probability differs by about 0.00131 under the documented 0.02
 tolerance. The Metal oracle additionally compares every logit with the CPU
 reference under a 0.001 tolerance and forces the real model through a one-slot
-expert cache. Conditions and local M4 Max results are retained in
+expert cache. It also verifies token-for-token equality across a persistent KV
+session. The server oracle runs simultaneous streaming and non-streaming
+clients, disconnect recovery, loaded-model reporting, and graceful shutdown.
+Conditions and local M4 Max results are retained in
 [`benchmarks/2026-08-18-gemma4-m4-max.md`](benchmarks/2026-08-18-gemma4-m4-max.md).

@@ -254,6 +254,8 @@ figures are retained in `benchmarks/2026-08-18-gemma4-m4-max.md`.
 
 ### Phase 5: chat polish and local server
 
+Status: complete on 2026-08-18 for Gemma 4 CLI and local HTTP clients.
+
 - Finish the interactive terminal UX, history management, streaming, and clean
   cancellation.
 - Implement `diskmule --serve` using the proven runtime API.
@@ -263,6 +265,22 @@ figures are retained in `benchmarks/2026-08-18-gemma4-m4-max.md`.
 
 Exit criterion: both CLI chat and server clients use the same generation engine
 and produce equivalent configured results.
+
+Evidence: CLI and HTTP both submit the same `ChatMessage` and
+`GenerationOptions` types to bounded, model-owning worker threads. Named and
+direct-path resolution share the catalog. CPU and Metal sessions retain KV
+state only across an exact token prefix, roll back after failure or
+cancellation, and are capped by deterministic per-model LRU eviction. The CLI
+streams text, preserves history, supports clear/help/exit/EOF, and returns to a
+clean prompt after Ctrl-C cancellation. Sampling supports deterministic greedy
+or seeded temperature/top-k/top-p selection. The loopback-default server
+provides health, loaded-model status, and Ollama-style streaming or
+non-streaming `/api/chat`, with bounded model, context, request, token, and
+session resources. Fast tests cover malformed requests and shutdown. A pinned
+real-model oracle passed simultaneous JSON and NDJSON clients, disconnect
+cancellation and recovery, loaded-model reporting, and worker-joining graceful
+shutdown. CLI and both server modes produced the same configured greedy
+`Hello` token.
 
 ### Phase 6: GLM-5.2 and genuine out-of-core operation
 
@@ -303,9 +321,9 @@ server, CLI, or session code unless it introduces a genuinely new capability.
 
 ## Current milestone
 
-Build Phase 5's shared production inference surface without weakening the
-proven CPU, Metal, storage-backed expert, or model ownership boundaries. These
-commands already work:
+Build Phase 6's explicit safetensors and GLM-5.2 implementation without
+weakening the proven Gemma, server, session, storage-backed expert, or model
+ownership boundaries. These commands already work:
 
 ```text
 diskmule ls
@@ -314,8 +332,9 @@ diskmule rm gemma4:26b
 diskmule --serve
 ```
 
-`ls` identifies the Ollama-owned Gemma model, `run` provides Metal chat on
-supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
-external deletion, and `--serve` provides a minimal health endpoint. Phase 5
-must make CLI and HTTP clients share bounded sessions, streaming, cancellation,
-and generation configuration.
+`ls` identifies the Ollama-owned Gemma model, `run` provides cancellable Metal
+chat on supported Apple Silicon with an explicit CPU fallback, `rm` safely
+refuses external deletion, and `--serve` provides bounded streaming and
+non-streaming chat. Phase 6 must first add fixture-backed safetensors and GLM
+semantics. A full GLM-5.2 claim still requires the real out-of-core model and
+explicit authorization for any large download or disk commitment.
