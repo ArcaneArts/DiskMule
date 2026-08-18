@@ -1,6 +1,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline ushort load_u16_le(device const uchar *bytes) {
+    return ushort(bytes[0]) | (ushort(bytes[1]) << 8);
+}
+
+inline uint load_u32_le(device const uchar *bytes) {
+    return uint(bytes[0])
+        | (uint(bytes[1]) << 8)
+        | (uint(bytes[2]) << 16)
+        | (uint(bytes[3]) << 24);
+}
+
 inline float load_f16(device const uchar *bytes) {
     const ushort bits = ushort(bytes[0]) | (ushort(bytes[1]) << 8);
     return float(as_type<half>(bits));
@@ -193,10 +204,11 @@ kernel void matvec_f32(
     constant uint &columns [[buffer(3)]],
     constant uint &row_bytes [[buffer(4)]],
     uint row [[thread_position_in_grid]]) {
-    device const float *weights = (device const float *)(encoded + row * row_bytes);
+    device const uchar *weights = encoded + row * row_bytes;
     float sum = 0.0f;
     for (uint column = 0; column < columns; column++) {
-        sum = fma(weights[column], input[column], sum);
+        const float weight = as_type<float>(load_u32_le(weights + column * 4));
+        sum = fma(weight, input[column], sum);
     }
     output[row] = sum;
 }
@@ -208,10 +220,58 @@ kernel void matvec_f16(
     constant uint &columns [[buffer(3)]],
     constant uint &row_bytes [[buffer(4)]],
     uint row [[thread_position_in_grid]]) {
-    device const half *weights = (device const half *)(encoded + row * row_bytes);
+    device const uchar *weights = encoded + row * row_bytes;
     float sum = 0.0f;
     for (uint column = 0; column < columns; column++) {
-        sum = fma(float(weights[column]), input[column], sum);
+        const half weight = as_type<half>(load_u16_le(weights + column * 2));
+        sum = fma(float(weight), input[column], sum);
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_bf16(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &row_bytes [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *weights = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        const float weight = as_type<float>(uint(load_u16_le(weights + column * 2)) << 16);
+        sum = fma(weight, input[column], sum);
+    }
+    output[row] = sum;
+}
+
+inline float decode_f8_e4m3fn(uchar value) {
+    const float sign = (value & 0x80) == 0 ? 1.0f : -1.0f;
+    const uint exponent = (uint(value) >> 3) & 0x0f;
+    const uint fraction = uint(value) & 0x07;
+    if (exponent == 0x0f && fraction == 0x07) {
+        return NAN;
+    }
+    const float magnitude = exponent == 0
+        ? float(fraction) * 0.001953125f
+        : (1.0f + float(fraction) * 0.125f) * exp2(float(int(exponent) - 7));
+    return sign * magnitude;
+}
+
+kernel void matvec_f8_e4m3fn(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *scales [[buffer(1)]],
+    device const float *input [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    constant uint &scale_columns [[buffer(5)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *weights = encoded + row * columns;
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        const uint scale_index = (row / 128) * scale_columns + column / 128;
+        const float weight = decode_f8_e4m3fn(weights[column]) * scales[scale_index];
+        sum = fma(weight, input[column], sum);
     }
     output[row] = sum;
 }

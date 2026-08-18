@@ -17,6 +17,9 @@ use crate::{
     safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
 };
 
+#[cfg(target_os = "macos")]
+use crate::{glm52::metal::Glm52MetalWeights, metal::MetalError};
+
 const FP8_BLOCK: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +35,10 @@ pub enum Glm52CpuError {
 
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Metal(#[from] MetalError),
 
     #[error("safetensors tensor index {index} is out of bounds for {count} tensors")]
     TensorIndex { index: usize, count: usize },
@@ -109,6 +116,8 @@ pub struct Glm52CpuModel {
     source: SafeTensorSource,
     max_context: usize,
     expert_cache: Mutex<Glm52ExpertCache>,
+    #[cfg(target_os = "macos")]
+    metal: Option<Glm52MetalWeights>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,7 +146,22 @@ impl Glm52CpuModel {
         directory: impl AsRef<Path>,
         max_context: usize,
     ) -> Result<Self, Glm52CpuError> {
-        let directory = directory.as_ref();
+        Self::build(directory.as_ref(), max_context, false)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn from_directory_with_context_and_metal(
+        directory: impl AsRef<Path>,
+        max_context: usize,
+    ) -> Result<Self, Glm52CpuError> {
+        Self::build(directory.as_ref(), max_context, true)
+    }
+
+    fn build(
+        directory: &Path,
+        max_context: usize,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] use_metal: bool,
+    ) -> Result<Self, Glm52CpuError> {
         let config = Glm52Config::from_directory(directory)?;
         if max_context == 0 {
             return Err(Glm52CpuError::ContextExceeded { maximum: 0 });
@@ -155,6 +179,10 @@ impl Glm52CpuModel {
         let source = SafeTensorSource::open(directory)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
         let expert_cache = Glm52ExpertCache::new(source.clone(), &weights, expert_cache_slots()?)?;
+        #[cfg(target_os = "macos")]
+        let metal = use_metal
+            .then(|| Glm52MetalWeights::new(&source))
+            .transpose()?;
         Ok(Self {
             config,
             tokenizer,
@@ -162,7 +190,14 @@ impl Glm52CpuModel {
             source,
             max_context,
             expert_cache: Mutex::new(expert_cache),
+            #[cfg(target_os = "macos")]
+            metal,
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn metal_device_name(&self) -> Option<String> {
+        self.metal.as_ref().map(Glm52MetalWeights::device_name)
     }
 
     pub fn new_session(&self) -> Glm52CpuSession {
@@ -236,7 +271,11 @@ impl Glm52CpuModel {
         cancelled: &AtomicBool,
     ) -> Result<Vec<f32>, Glm52CpuError> {
         check_cancelled(cancelled)?;
-        let reader = TensorReader::new(&self.source);
+        let mut reader = TensorReader::new(&self.source);
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_ref() {
+            reader = reader.with_metal(metal);
+        }
         let mut hidden = reader.matrix_row(self.weights.token_embedding, token as usize)?;
         for (layer_index, weights) in self.weights.layers.iter().enumerate() {
             check_cancelled(cancelled)?;
@@ -659,11 +698,23 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Glm52CpuError> {
 /// Reads and computes directly from safetensors ranges without materializing a shard.
 pub struct TensorReader<'a> {
     source: &'a SafeTensorSource,
+    #[cfg(target_os = "macos")]
+    metal: Option<&'a Glm52MetalWeights>,
 }
 
 impl<'a> TensorReader<'a> {
     pub const fn new(source: &'a SafeTensorSource) -> Self {
-        Self { source }
+        Self {
+            source,
+            #[cfg(target_os = "macos")]
+            metal: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub const fn with_metal(mut self, metal: &'a Glm52MetalWeights) -> Self {
+        self.metal = Some(metal);
+        self
     }
 
     pub fn vector(&self, tensor_index: usize) -> Result<Vec<f32>, Glm52CpuError> {
@@ -749,6 +800,11 @@ impl<'a> TensorReader<'a> {
                 expected: rows,
                 actual: output.len(),
             });
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal {
+            metal.matvec(self.source, tensor_index, input, output)?;
+            return Ok(());
         }
         let mut row = vec![0.0; columns];
         for (row_index, result) in output.iter_mut().enumerate() {
@@ -1090,6 +1146,33 @@ mod tests {
             replay_logits = model.forward_token(&mut replay, token, &cancelled).unwrap();
         }
         assert_eq!(final_logits, replay_logits);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_mapped_matrices_match_the_cpu_transformer_graph() {
+        let temp = TempDir::new().unwrap();
+        write_tiny_model(temp.path());
+        let cpu = Glm52CpuModel::from_directory(temp.path()).unwrap();
+        let metal = Glm52CpuModel::from_directory_with_context_and_metal(temp.path(), 8).unwrap();
+        assert!(metal.metal_device_name().is_some());
+
+        let cancelled = AtomicBool::new(false);
+        let mut cpu_session = cpu.start_session(8);
+        let mut metal_session = metal.start_session(8);
+        for token in [1, 2, 3, 4] {
+            let cpu_logits = cpu
+                .forward_token(&mut cpu_session, token, &cancelled)
+                .unwrap();
+            let metal_logits = metal
+                .forward_token(&mut metal_session, token, &cancelled)
+                .unwrap();
+            assert_eq!(argmax(&cpu_logits), argmax(&metal_logits));
+            for (cpu, metal) in cpu_logits.iter().zip(&metal_logits) {
+                assert!((cpu - metal).abs() < 1e-4, "{cpu} != {metal}");
+            }
+        }
+        assert_eq!(cpu_session.dsa_selection, metal_session.dsa_selection);
     }
 
     #[test]

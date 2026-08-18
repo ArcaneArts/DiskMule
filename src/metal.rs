@@ -146,7 +146,7 @@ mod implementation {
     };
 
     use super::MetalError;
-    use crate::gguf::TensorType;
+    use crate::{gguf::TensorType, safetensors::SafeDtype};
 
     const SHADERS: &str = include_str!("../metal/kernels.metal");
     const VECTOR_ADD: &str = "vector_add";
@@ -158,6 +158,8 @@ mod implementation {
     const DETERMINISTIC_ARGMAX: &str = "deterministic_argmax";
     const MATVEC_F32: &str = "matvec_f32";
     const MATVEC_F16: &str = "matvec_f16";
+    const MATVEC_BF16: &str = "matvec_bf16";
+    const MATVEC_F8_E4M3FN: &str = "matvec_f8_e4m3fn";
     const MATVEC_Q5_0: &str = "matvec_q5_0";
     const MATVEC_Q8_0: &str = "matvec_q8_0";
     const MATVEC_Q4_K: &str = "matvec_q4_k";
@@ -184,6 +186,8 @@ mod implementation {
         deterministic_argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_f8_e4m3fn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q5_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q4_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -294,6 +298,8 @@ mod implementation {
             let deterministic_argmax = pipeline(&device, &library, DETERMINISTIC_ARGMAX)?;
             let matvec_f32 = pipeline(&device, &library, MATVEC_F32)?;
             let matvec_f16 = pipeline(&device, &library, MATVEC_F16)?;
+            let matvec_bf16 = pipeline(&device, &library, MATVEC_BF16)?;
+            let matvec_f8_e4m3fn = pipeline(&device, &library, MATVEC_F8_E4M3FN)?;
             let matvec_q5_0 = pipeline(&device, &library, MATVEC_Q5_0)?;
             let matvec_q8_0 = pipeline(&device, &library, MATVEC_Q8_0)?;
             let matvec_q4_k = pipeline(&device, &library, MATVEC_Q4_K)?;
@@ -314,6 +320,8 @@ mod implementation {
                 deterministic_argmax,
                 matvec_f32,
                 matvec_f16,
+                matvec_bf16,
+                matvec_f8_e4m3fn,
                 matvec_q5_0,
                 matvec_q8_0,
                 matvec_q4_k,
@@ -685,6 +693,139 @@ mod implementation {
                 rows,
                 rows.min(REDUCTION_THREADS),
             )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        /// Execute GEMV directly from one or two retained safetensors shard mappings.
+        #[allow(clippy::too_many_arguments)]
+        pub fn matvec_safetensor_mapped(
+            &self,
+            dtype: SafeDtype,
+            rows: usize,
+            columns: usize,
+            mapping: &MetalMappedBuffer,
+            encoded_offset: usize,
+            encoded_length: usize,
+            scale: Option<(&MetalMappedBuffer, usize, usize)>,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            match dtype {
+                SafeDtype::F32 => {
+                    return self.matvec_mapped(
+                        TensorType::F32,
+                        rows,
+                        columns,
+                        mapping,
+                        encoded_offset,
+                        encoded_length,
+                        input,
+                        output,
+                    );
+                }
+                SafeDtype::F16 => {
+                    return self.matvec_mapped(
+                        TensorType::F16,
+                        rows,
+                        columns,
+                        mapping,
+                        encoded_offset,
+                        encoded_length,
+                        input,
+                        output,
+                    );
+                }
+                SafeDtype::Bf16 | SafeDtype::F8E4M3 => {}
+                _ => return Err(MetalError::UnsupportedTensorType("safetensors dtype")),
+            }
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let byte_width = if dtype == SafeDtype::Bf16 { 2 } else { 1 };
+            let expected = rows
+                .checked_mul(columns)
+                .and_then(|elements| elements.checked_mul(byte_width))
+                .ok_or(MetalError::Overflow)?;
+            if encoded_length != expected {
+                return Err(MetalError::InvalidByteLength {
+                    kind: if dtype == SafeDtype::Bf16 {
+                        "BF16"
+                    } else {
+                        "F8_E4M3FN"
+                    },
+                    expected,
+                    actual: encoded_length,
+                });
+            }
+            checked_mapped_range(mapping, encoded_offset, encoded_length)?;
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("safetensors matvec", input)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            if dtype == SafeDtype::Bf16 {
+                let row_bytes_buffer = self.buffer_with_data(&[count_u32(columns * 2)?])?;
+                self.execute_with_first_offset(
+                    &self.matvec_bf16,
+                    &mapping.buffer,
+                    encoded_offset,
+                    &[
+                        &input_buffer,
+                        &output_buffer,
+                        &columns_buffer,
+                        &row_bytes_buffer,
+                    ],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?;
+            } else {
+                let (scale_mapping, scale_offset, scale_length) =
+                    scale.ok_or(MetalError::InvalidByteLength {
+                        kind: "F8_E4M3FN scale",
+                        expected: rows.div_ceil(128) * columns.div_ceil(128) * 4,
+                        actual: 0,
+                    })?;
+                let expected_scale = rows
+                    .div_ceil(128)
+                    .checked_mul(columns.div_ceil(128))
+                    .and_then(|elements| elements.checked_mul(4))
+                    .ok_or(MetalError::Overflow)?;
+                if scale_length != expected_scale {
+                    return Err(MetalError::InvalidByteLength {
+                        kind: "F8_E4M3FN scale",
+                        expected: expected_scale,
+                        actual: scale_length,
+                    });
+                }
+                checked_mapped_range(scale_mapping, scale_offset, scale_length)?;
+                let scale_columns_buffer =
+                    self.buffer_with_data(&[count_u32(columns.div_ceil(128))?])?;
+                self.execute_with_two_offsets(
+                    &self.matvec_f8_e4m3fn,
+                    (&mapping.buffer, encoded_offset),
+                    (&scale_mapping.buffer, scale_offset),
+                    &[
+                        &input_buffer,
+                        &output_buffer,
+                        &columns_buffer,
+                        &scale_columns_buffer,
+                    ],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?;
+            }
             copy_buffer(&output_buffer, output);
             Ok(())
         }
@@ -1197,6 +1338,58 @@ mod implementation {
             Ok(())
         }
 
+        #[allow(clippy::too_many_arguments)]
+        fn execute_with_two_offsets(
+            &self,
+            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+            first: (&ProtocolObject<dyn MTLBuffer>, usize),
+            second: (&ProtocolObject<dyn MTLBuffer>, usize),
+            remaining: &[&ProtocolObject<dyn MTLBuffer>],
+            grid_width: usize,
+            threadgroup_width: usize,
+        ) -> Result<(), MetalError> {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandEncoding)?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandEncoding)?;
+            encoder.setComputePipelineState(pipeline);
+            // SAFETY: callers range-check both retained mappings and retain all
+            // buffers through this synchronous command completion.
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(first.0), first.1, 0);
+                encoder.setBuffer_offset_atIndex(Some(second.0), second.1, 1);
+            }
+            for (index, buffer) in remaining.iter().enumerate() {
+                // SAFETY: each retained buffer remains live until completion.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index + 2) };
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: grid_width,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threadgroup_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::Command(command_buffer.error().map_or_else(
+                    || "unknown command-buffer error".to_owned(),
+                    |error| error.to_string(),
+                )));
+            }
+            Ok(())
+        }
+
         fn buffer_with_data<T>(
             &self,
             values: &[T],
@@ -1280,6 +1473,22 @@ mod implementation {
         }
     }
 
+    fn checked_mapped_range(
+        mapping: &MetalMappedBuffer,
+        offset: usize,
+        length: usize,
+    ) -> Result<(), MetalError> {
+        let end = offset.checked_add(length).ok_or(MetalError::Overflow)?;
+        if end > mapping.len() {
+            return Err(MetalError::MappedRange {
+                offset,
+                end,
+                length: mapping.len(),
+            });
+        }
+        Ok(())
+    }
+
     fn count_u32(value: usize) -> Result<u32, MetalError> {
         u32::try_from(value).map_err(|_| MetalError::VectorTooLarge)
     }
@@ -1347,7 +1556,7 @@ mod implementation {
         use memmap2::MmapOptions;
         use objc2_metal::MTLBuffer;
 
-        use crate::{cpu, gguf::TensorType};
+        use crate::{cpu, gguf::TensorType, safetensors::SafeDtype};
 
         use super::MetalContext;
 
@@ -1622,6 +1831,68 @@ mod implementation {
                 )
                 .unwrap();
             assert_eq!(output, [-1.5, -2.5]);
+        }
+
+        #[test]
+        fn mapped_safetensors_bf16_and_fp8_match_cpu_values() {
+            let context = MetalContext::new().unwrap();
+            let bf16_offset = 32;
+            let bf16 = [1.0_f32, 2.0, 3.0, -1.0, 0.5, 4.0]
+                .into_iter()
+                .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
+                .collect::<Vec<_>>();
+            let fp8_offset = 64;
+            let fp8 = vec![0x38_u8; 129 * 130];
+            let scale_offset = fp8_offset + fp8.len() + 2;
+            let scales = [2.0_f32, 3.0, 5.0, 7.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut contents = vec![0_u8; scale_offset + scales.len()];
+            contents[bf16_offset..bf16_offset + bf16.len()].copy_from_slice(&bf16);
+            contents[fp8_offset..fp8_offset + fp8.len()].copy_from_slice(&fp8);
+            contents[scale_offset..scale_offset + scales.len()].copy_from_slice(&scales);
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&contents).unwrap();
+            file.flush().unwrap();
+            // SAFETY: the file remains immutable for the mapping lifetime.
+            let mapping = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+            let mapped = context.map_read_only(mapping).unwrap();
+
+            let mut bf16_output = [0.0; 2];
+            context
+                .matvec_safetensor_mapped(
+                    SafeDtype::Bf16,
+                    2,
+                    3,
+                    &mapped,
+                    bf16_offset,
+                    bf16.len(),
+                    None,
+                    &[2.0, -1.0, 0.5],
+                    &mut bf16_output,
+                )
+                .unwrap();
+            assert_close(&bf16_output, &[1.5, -0.5], 1e-6);
+
+            let mut input = vec![1.0; 130];
+            input[129] = 2.0;
+            let mut fp8_output = vec![0.0; 129];
+            context
+                .matvec_safetensor_mapped(
+                    SafeDtype::F8E4M3,
+                    129,
+                    130,
+                    &mapped,
+                    fp8_offset,
+                    fp8.len(),
+                    Some((&mapped, scale_offset, scales.len())),
+                    &input,
+                    &mut fp8_output,
+                )
+                .unwrap();
+            assert_close(&fp8_output[..128], &vec![265.0; 128], 1e-5);
+            assert!((fp8_output[128] - 661.0).abs() < 1e-5);
         }
 
         #[test]

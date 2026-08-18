@@ -12,6 +12,8 @@ use crate::safetensors::{SafeDtype, SafeTensorIndex, SafeTensorInfo};
 
 pub mod cpu;
 pub mod expert;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod tokenizer;
 
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;

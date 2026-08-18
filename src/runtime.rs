@@ -381,17 +381,20 @@ impl GenerationEngine {
         name: impl Into<String>,
         path: impl AsRef<Path>,
         context: usize,
-        requested_backend: BackendSelection,
+        backend: BackendSelection,
     ) -> Result<Self, RuntimeError> {
-        if requested_backend != BackendSelection::Cpu {
-            tracing::warn!("GLM-5.2 Metal is not active yet; using the CPU correctness backend");
-        }
         let path = path.as_ref().to_path_buf();
-        let model = Glm52CpuModel::from_directory_with_context(&path, context)?;
+        let model = match backend {
+            BackendSelection::Cpu => Glm52CpuModel::from_directory_with_context(&path, context)?,
+            #[cfg(target_os = "macos")]
+            BackendSelection::Metal { .. } => {
+                Glm52CpuModel::from_directory_with_context_and_metal(&path, context)?
+            }
+        };
         Ok(Self {
             name: name.into(),
             path,
-            backend: BackendSelection::Cpu,
+            backend,
             model: ArchitectureModel::Glm52Cpu(model),
         })
     }
@@ -1021,11 +1024,7 @@ fn spawn_model_worker(
     let worker_status = Arc::clone(&status);
     let worker_name = name.clone();
     let load_architecture = architecture.clone();
-    let backend_label = if architecture == "glm_moe_dsa" {
-        "CPU (GLM correctness backend)".to_owned()
-    } else {
-        backend.label()
-    };
+    let backend_label = backend.label();
     let thread = thread::Builder::new()
         .name("diskmule-model".to_owned())
         .spawn(move || {
