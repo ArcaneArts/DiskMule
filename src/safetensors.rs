@@ -365,6 +365,7 @@ impl SafeTensorIndex {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SafeTensorSource {
     pub index: SafeTensorIndex,
     files: Vec<Arc<File>>,

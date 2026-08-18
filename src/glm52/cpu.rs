@@ -1,7 +1,9 @@
 //! Payload-lazy CPU execution for GLM-5.2 safetensors weights.
 
 use std::{
+    env,
     path::Path,
+    sync::Mutex,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -9,6 +11,7 @@ use crate::{
     glm52::{
         Glm52Config, Glm52Error, Glm52FeedForwardWeights, Glm52IndexerWeights, Glm52LayerWeights,
         Glm52Weights, IndexerKind,
+        expert::{Glm52ExpertCache, Glm52ExpertCacheError, Glm52ExpertCacheStats},
         tokenizer::{Glm52Tokenizer, Glm52TokenizerError},
     },
     safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
@@ -23,6 +26,9 @@ pub enum Glm52CpuError {
 
     #[error(transparent)]
     Tokenizer(#[from] Glm52TokenizerError),
+
+    #[error(transparent)]
+    ExpertCache(#[from] Glm52ExpertCacheError),
 
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
@@ -90,6 +96,9 @@ pub enum Glm52CpuError {
 
     #[error("GLM-5.2 shared DSA layer {layer} has no preceding full-layer selection")]
     MissingDsaSelection { layer: usize },
+
+    #[error("invalid GLM-5.2 expert-cache configuration: {0}")]
+    InvalidExpertCache(String),
 }
 
 /// A loaded CPU model. Dense tensors remain on disk and are read by range as needed.
@@ -99,6 +108,7 @@ pub struct Glm52CpuModel {
     pub weights: Glm52Weights,
     source: SafeTensorSource,
     max_context: usize,
+    expert_cache: Mutex<Glm52ExpertCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -144,17 +154,26 @@ impl Glm52CpuModel {
         }
         let source = SafeTensorSource::open(directory)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
+        let expert_cache = Glm52ExpertCache::new(source.clone(), &weights, expert_cache_slots()?)?;
         Ok(Self {
             config,
             tokenizer,
             weights,
             source,
             max_context,
+            expert_cache: Mutex::new(expert_cache),
         })
     }
 
     pub fn new_session(&self) -> Glm52CpuSession {
         self.start_session(self.max_context)
+    }
+
+    pub fn expert_cache_stats(&self) -> Result<Glm52ExpertCacheStats, Glm52CpuError> {
+        self.expert_cache
+            .lock()
+            .map(|cache| cache.stats())
+            .map_err(|_| Glm52ExpertCacheError::Poisoned.into())
     }
 
     pub fn start_session(&self, maximum_context: usize) -> Glm52CpuSession {
@@ -486,9 +505,11 @@ impl Glm52CpuModel {
                 let mut output = vec![0.0; self.config.hidden_size];
                 for (expert, _, weight) in choices {
                     check_cancelled(cancelled)?;
-                    let weights = &experts[expert];
-                    let expert_output =
-                        mlp(reader, weights.gate, weights.up, weights.down, hidden)?;
+                    let expert_output = self
+                        .expert_cache
+                        .lock()
+                        .map_err(|_| Glm52ExpertCacheError::Poisoned)?
+                        .with_expert(layer, expert, cancelled, |cached| cached.mlp(hidden))?;
                     for (output, value) in output.iter_mut().zip(expert_output) {
                         *output += value * weight * self.config.routed_scale;
                     }
@@ -499,6 +520,20 @@ impl Glm52CpuModel {
             }
         }
     }
+}
+
+fn expert_cache_slots() -> Result<usize, Glm52CpuError> {
+    let Some(raw) = env::var_os("DISKMULE_GLM_EXPERT_SLOTS") else {
+        return Ok(8);
+    };
+    raw.to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (1..=256).contains(value))
+        .ok_or_else(|| {
+            Glm52CpuError::InvalidExpertCache(
+                "DISKMULE_GLM_EXPERT_SLOTS must be an integer in 1..=256".to_owned(),
+            )
+        })
 }
 
 impl Glm52CpuSession {

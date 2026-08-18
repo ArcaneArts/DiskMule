@@ -604,6 +604,7 @@ where
         .flatten();
     session.truncate(reusable);
     session.logits = stable_logits.clone();
+    let cache_before = model.expert_cache_stats()?;
 
     let result = (|| {
         let started = Instant::now();
@@ -679,6 +680,20 @@ where
                 );
             }
         }
+        let cache_after = model.expert_cache_stats()?;
+        profile.expert_cache_hits = cache_after.hits.saturating_sub(cache_before.hits);
+        profile.expert_cache_misses = cache_after.misses.saturating_sub(cache_before.misses);
+        profile.expert_cache_evictions =
+            cache_after.evictions.saturating_sub(cache_before.evictions);
+        profile.expert_reads = cache_after.reads.saturating_sub(cache_before.reads);
+        profile.expert_bytes_read = cache_after
+            .bytes_read
+            .saturating_sub(cache_before.bytes_read);
+        profile.expert_io_wait = cache_after
+            .io_wait
+            .checked_sub(cache_before.io_wait)
+            .unwrap_or_default();
+        profile.expert_resident_bytes = cache_after.resident_bytes;
         profile.total_time = started.elapsed();
         Ok(GenerationResult {
             text: model.tokenizer.decode(&generated, false)?,
@@ -1441,6 +1456,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(direct.token_ids, [5]);
+        assert!(direct.profile.expert_cache_misses > 0);
+        assert!(direct.profile.expert_reads > 0);
 
         let messages = [ChatMessage::new(ChatRole::User, "!")];
         let options = GenerationOptions {
