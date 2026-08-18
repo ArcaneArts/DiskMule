@@ -18,6 +18,7 @@ use cli::{Action, Cli};
 use config::Paths;
 use error::{AppError, Result};
 use model::{ModelCatalog, format_size};
+use runtime::{BackendSelection, RuntimeLimits, RuntimeService};
 
 /// Runs one parsed DiskMule command.
 ///
@@ -35,7 +36,20 @@ pub async fn execute_with_io(
     output: &mut impl Write,
 ) -> Result<()> {
     match cli.action()? {
-        Action::Serve => server::serve(server::DEFAULT_BIND, server::shutdown_signal()).await?,
+        Action::Serve => {
+            let runtime = RuntimeService::new(
+                paths.clone(),
+                config::ollama_models_dir()?,
+                BackendSelection::from_environment()?,
+                RuntimeLimits::from_environment()?,
+            )?;
+            server::serve(
+                server::bind_from_environment()?,
+                runtime,
+                server::shutdown_signal(),
+            )
+            .await?;
+        }
         Action::Run { model } => {
             let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;
             let record = catalog.resolve_for_run(model)?;

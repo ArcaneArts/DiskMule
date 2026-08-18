@@ -55,6 +55,9 @@ pub enum ServiceError {
 
     #[error("invalid runtime limits: {0}")]
     InvalidLimits(String),
+
+    #[error("invalid generation request: {0}")]
+    InvalidRequest(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +80,16 @@ impl Default for RuntimeLimits {
 }
 
 impl RuntimeLimits {
+    pub fn from_environment() -> Result<Self, ServiceError> {
+        Self {
+            context: bounded_environment("DISKMULE_CONTEXT", DEFAULT_CONTEXT, 1, 262_144)?,
+            maximum_loaded_models: bounded_environment("DISKMULE_MAX_MODELS", 1, 1, 16)?,
+            request_queue: bounded_environment("DISKMULE_REQUEST_QUEUE", 8, 1, 1_024)?,
+            token_buffer: bounded_environment("DISKMULE_TOKEN_BUFFER", 32, 1, 4_096)?,
+        }
+        .validate()
+    }
+
     pub fn validate(self) -> Result<Self, ServiceError> {
         if !(1..=262_144).contains(&self.context) {
             return Err(ServiceError::InvalidLimits(
@@ -100,6 +113,25 @@ impl RuntimeLimits {
         }
         Ok(self)
     }
+}
+
+fn bounded_environment(
+    name: &'static str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, ServiceError> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(default);
+    };
+    raw.to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| (minimum..=maximum).contains(value))
+        .ok_or_else(|| {
+            ServiceError::InvalidLimits(format!(
+                "{name} must be an integer in {minimum}..={maximum}"
+            ))
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +495,32 @@ impl RuntimeService {
         messages: Vec<ChatMessage>,
         options: GenerationOptions,
     ) -> Result<GenerationTicket, ServiceError> {
+        options
+            .validate()
+            .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
+        if messages.is_empty() {
+            return Err(ServiceError::InvalidRequest(
+                "messages must contain at least one chat turn".to_owned(),
+            ));
+        }
+        if messages.len() > 1_024 {
+            return Err(ServiceError::InvalidRequest(
+                "messages must contain at most 1024 chat turns".to_owned(),
+            ));
+        }
+        let content_bytes = messages
+            .iter()
+            .try_fold(0_usize, |total, message| {
+                total.checked_add(message.content.len())
+            })
+            .ok_or_else(|| {
+                ServiceError::InvalidRequest("message content size overflowed".to_owned())
+            })?;
+        if content_bytes > 1024 * 1024 {
+            return Err(ServiceError::InvalidRequest(
+                "message content must be at most 1 MiB".to_owned(),
+            ));
+        }
         let catalog = ModelCatalog::discover(&self.inner.paths, self.inner.ollama_root.clone())?;
         let record = catalog.resolve_for_run(model)?;
         if !record.compatibility.is_metadata_compatible() {
