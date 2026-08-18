@@ -1709,6 +1709,36 @@ mod tests {
         assert_eq!(cpu_session.dsa_selection, metal_session.dsa_selection);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_grouped_int4_graph_and_streamed_experts_match_cpu() {
+        let quantized_directory = TempDir::new().unwrap();
+        let reference_directory = TempDir::new().unwrap();
+        write_tiny_quantized_pair(quantized_directory.path(), reference_directory.path());
+        let cpu = Glm52CpuModel::from_directory(quantized_directory.path()).unwrap();
+        let metal =
+            Glm52CpuModel::from_directory_with_context_and_metal(quantized_directory.path(), 8)
+                .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut cpu_session = cpu.start_session(8);
+        let mut metal_session = metal.start_session(8);
+        for token in [1, 2, 3, 4] {
+            let expected = cpu
+                .forward_token(&mut cpu_session, token, &cancelled)
+                .unwrap();
+            let actual = metal
+                .forward_token(&mut metal_session, token, &cancelled)
+                .unwrap();
+            assert_eq!(argmax(&actual), argmax(&expected));
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+            }
+        }
+        let stats = metal.expert_cache_stats().unwrap();
+        assert!(stats.misses > 0);
+        assert!(stats.bytes_read > 0);
+    }
+
     #[test]
     fn cancellation_and_context_errors_do_not_advance_the_cache() {
         let temp = TempDir::new().unwrap();

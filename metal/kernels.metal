@@ -288,6 +288,49 @@ kernel void matvec_f8_e4m3fn(
     output[row] = sum;
 }
 
+kernel void matvec_i8_row(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *scales [[buffer(1)]],
+    device const float *input [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    uint row [[thread_position_in_grid]]) {
+    device const uchar *weights = encoded + row * columns;
+    const float scale = scales[row];
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        const int quantized = weights[column] < 128
+            ? int(weights[column])
+            : int(weights[column]) - 256;
+        sum = fma(float(quantized) * scale, input[column], sum);
+    }
+    output[row] = sum;
+}
+
+kernel void matvec_i4_grouped(
+    device const uchar *encoded [[buffer(0)]],
+    device const float *scales [[buffer(1)]],
+    device const float *input [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    constant uint &scale_columns [[buffer(5)]],
+    constant uint &group_size [[buffer(6)]],
+    uint row [[thread_position_in_grid]]) {
+    const uint row_bytes = (columns + 1) / 2;
+    device const uchar *weights = encoded + row * row_bytes;
+    float sum = 0.0f;
+    for (uint column = 0; column < columns; column++) {
+        const uchar packed = weights[column / 2];
+        const uint nibble = (column & 1) == 0
+            ? uint(packed & 0x0f)
+            : uint(packed >> 4);
+        const uint scale_index = row * scale_columns + column / group_size;
+        const float weight = float(int(nibble) - 8) * scales[scale_index];
+        sum = fma(weight, input[column], sum);
+    }
+    output[row] = sum;
+}
+
 kernel void matvec_q5_0(
     device const uchar *encoded [[buffer(0)]],
     device const float *input [[buffer(1)]],

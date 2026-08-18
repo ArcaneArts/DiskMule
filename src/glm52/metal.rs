@@ -5,7 +5,10 @@ use std::{fs::File, sync::Arc};
 use memmap2::MmapOptions;
 
 use crate::{
-    glm52::expert::{CachedExpert, Glm52ExpertCacheError},
+    glm52::{
+        expert::{CachedExpert, Glm52ExpertCacheError},
+        quant::resolve_quantization,
+    },
     metal::{MetalContext, MetalError, MetalMappedBuffer},
     safetensors::{SafeDtype, SafeTensorSource},
 };
@@ -60,24 +63,45 @@ impl Glm52MetalWeights {
             .tensors()
             .get(tensor_index)
             .ok_or(MetalError::Overflow)?;
-        if tensor.shape.len() != 2 {
-            return Err(MetalError::UnsupportedTensorType(
-                "non-matrix safetensors tensor",
-            ));
-        }
-        let rows = usize::try_from(tensor.shape[0]).map_err(|_| MetalError::Overflow)?;
-        let columns = usize::try_from(tensor.shape[1]).map_err(|_| MetalError::Overflow)?;
+        let (rows, columns) = if tensor.dtype == SafeDtype::U8 {
+            resolve_quantization(
+                &source.index,
+                tensor,
+                u64::try_from(output.len()).map_err(|_| MetalError::Overflow)?,
+                u64::try_from(input.len()).map_err(|_| MetalError::Overflow)?,
+            )
+            .map_err(|error| MetalError::Command(error.to_string()))?;
+            (output.len(), input.len())
+        } else {
+            if tensor.shape.len() != 2 {
+                return Err(MetalError::UnsupportedTensorType(
+                    "non-matrix safetensors tensor",
+                ));
+            }
+            (
+                usize::try_from(tensor.shape[0]).map_err(|_| MetalError::Overflow)?,
+                usize::try_from(tensor.shape[1]).map_err(|_| MetalError::Overflow)?,
+            )
+        };
         let offset = usize::try_from(tensor.absolute_offset).map_err(|_| MetalError::Overflow)?;
         let length = usize::try_from(tensor.byte_len).map_err(|_| MetalError::Overflow)?;
         let mapping = self
             .mappings
             .get(tensor.shard)
             .ok_or(MetalError::Overflow)?;
-        let scale = if tensor.dtype == SafeDtype::F8E4M3 {
-            let scale = source
-                .index
-                .tensor(&format!("{}_scale_inv", tensor.name))
-                .ok_or(MetalError::UnsupportedTensorType("missing FP8 scale"))?;
+        let scale_name = match tensor.dtype {
+            SafeDtype::F8E4M3 => Some(format!("{}_scale_inv", tensor.name)),
+            SafeDtype::U8 => Some(format!("{}.qs", tensor.name)),
+            _ => None,
+        };
+        let scale = if let Some(scale_name) = scale_name {
+            let scale =
+                source
+                    .index
+                    .tensor(&scale_name)
+                    .ok_or(MetalError::UnsupportedTensorType(
+                        "missing safetensors quantization scale",
+                    ))?;
             Some((
                 self.mappings.get(scale.shard).ok_or(MetalError::Overflow)?,
                 usize::try_from(scale.absolute_offset).map_err(|_| MetalError::Overflow)?,

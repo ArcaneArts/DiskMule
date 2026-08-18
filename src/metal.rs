@@ -161,6 +161,8 @@ mod implementation {
     const MATVEC_F16: &str = "matvec_f16";
     const MATVEC_BF16: &str = "matvec_bf16";
     const MATVEC_F8_E4M3FN: &str = "matvec_f8_e4m3fn";
+    const MATVEC_I8_ROW: &str = "matvec_i8_row";
+    const MATVEC_I4_GROUPED: &str = "matvec_i4_grouped";
     const MATVEC_Q5_0: &str = "matvec_q5_0";
     const MATVEC_Q8_0: &str = "matvec_q8_0";
     const MATVEC_Q4_K: &str = "matvec_q4_k";
@@ -190,6 +192,8 @@ mod implementation {
         matvec_f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_f8_e4m3fn: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_i8_row: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        matvec_i4_grouped: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q5_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q8_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         matvec_q4_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -303,6 +307,8 @@ mod implementation {
             let matvec_f16 = pipeline(&device, &library, MATVEC_F16)?;
             let matvec_bf16 = pipeline(&device, &library, MATVEC_BF16)?;
             let matvec_f8_e4m3fn = pipeline(&device, &library, MATVEC_F8_E4M3FN)?;
+            let matvec_i8_row = pipeline(&device, &library, MATVEC_I8_ROW)?;
+            let matvec_i4_grouped = pipeline(&device, &library, MATVEC_I4_GROUPED)?;
             let matvec_q5_0 = pipeline(&device, &library, MATVEC_Q5_0)?;
             let matvec_q8_0 = pipeline(&device, &library, MATVEC_Q8_0)?;
             let matvec_q4_k = pipeline(&device, &library, MATVEC_Q4_K)?;
@@ -326,6 +332,8 @@ mod implementation {
                 matvec_f16,
                 matvec_bf16,
                 matvec_f8_e4m3fn,
+                matvec_i8_row,
+                matvec_i4_grouped,
                 matvec_q5_0,
                 matvec_q8_0,
                 matvec_q4_k,
@@ -764,6 +772,18 @@ mod implementation {
                         output,
                     );
                 }
+                SafeDtype::U8 => {
+                    return self.matvec_u8_mapped(
+                        rows,
+                        columns,
+                        mapping,
+                        encoded_offset,
+                        encoded_length,
+                        scale,
+                        input,
+                        output,
+                    );
+                }
                 SafeDtype::Bf16 | SafeDtype::F8E4M3 => {}
                 _ => return Err(MetalError::UnsupportedTensorType("safetensors dtype")),
             }
@@ -877,6 +897,9 @@ mod implementation {
                 SafeDtype::F16 => {
                     return self.matvec(TensorType::F16, rows, columns, encoded, input, output);
                 }
+                SafeDtype::U8 => {
+                    return self.matvec_u8(rows, columns, encoded, scales, input, output);
+                }
                 SafeDtype::Bf16 | SafeDtype::F8E4M3 => {}
                 _ => return Err(MetalError::UnsupportedTensorType("safetensors dtype")),
             }
@@ -963,6 +986,161 @@ mod implementation {
                     rows,
                     rows.min(REDUCTION_THREADS),
                 )?;
+            }
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn matvec_u8_mapped(
+            &self,
+            rows: usize,
+            columns: usize,
+            mapping: &MetalMappedBuffer,
+            encoded_offset: usize,
+            encoded_length: usize,
+            scale: Option<(&MetalMappedBuffer, usize, usize)>,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let (scale_mapping, scale_offset, scale_length) =
+                scale.ok_or(MetalError::InvalidByteLength {
+                    kind: "U8 quantization scales",
+                    expected: rows.saturating_mul(4),
+                    actual: 0,
+                })?;
+            let encoding = u8_matrix_encoding(rows, columns, encoded_length, scale_length)?;
+            checked_mapped_range(mapping, encoded_offset, encoded_length)?;
+            checked_mapped_range(scale_mapping, scale_offset, scale_length)?;
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("safetensors U8 matvec", input)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            match encoding {
+                U8MatrixEncoding::Int8Row => self.execute_with_two_offsets(
+                    &self.matvec_i8_row,
+                    (&mapping.buffer, encoded_offset),
+                    (&scale_mapping.buffer, scale_offset),
+                    &[&input_buffer, &output_buffer, &columns_buffer],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?,
+                U8MatrixEncoding::Int4Grouped {
+                    group_size,
+                    scale_columns,
+                } => {
+                    let scale_columns_buffer =
+                        self.buffer_with_data(&[count_u32(scale_columns)?])?;
+                    let group_size_buffer = self.buffer_with_data(&[count_u32(group_size)?])?;
+                    self.execute_with_two_offsets(
+                        &self.matvec_i4_grouped,
+                        (&mapping.buffer, encoded_offset),
+                        (&scale_mapping.buffer, scale_offset),
+                        &[
+                            &input_buffer,
+                            &output_buffer,
+                            &columns_buffer,
+                            &scale_columns_buffer,
+                            &group_size_buffer,
+                        ],
+                        rows,
+                        rows.min(REDUCTION_THREADS),
+                    )?;
+                }
+            }
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn matvec_u8(
+            &self,
+            rows: usize,
+            columns: usize,
+            encoded: &[u8],
+            scales: Option<&[f32]>,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let scales = scales.ok_or(MetalError::InvalidVectorLength {
+                operation: "safetensors U8 matvec",
+                argument: "scales",
+                expected: rows,
+                actual: 0,
+            })?;
+            let scale_length = scales.len().checked_mul(4).ok_or(MetalError::Overflow)?;
+            let encoding = u8_matrix_encoding(rows, columns, encoded.len(), scale_length)?;
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("safetensors U8 matvec", input)?;
+            let encoded_buffer = self.buffer_with_data(encoded)?;
+            let scales_buffer = self.buffer_with_data(scales)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            match encoding {
+                U8MatrixEncoding::Int8Row => self.execute(
+                    &self.matvec_i8_row,
+                    &[
+                        &encoded_buffer,
+                        &scales_buffer,
+                        &input_buffer,
+                        &output_buffer,
+                        &columns_buffer,
+                    ],
+                    rows,
+                    rows.min(REDUCTION_THREADS),
+                )?,
+                U8MatrixEncoding::Int4Grouped {
+                    group_size,
+                    scale_columns,
+                } => {
+                    let scale_columns_buffer =
+                        self.buffer_with_data(&[count_u32(scale_columns)?])?;
+                    let group_size_buffer = self.buffer_with_data(&[count_u32(group_size)?])?;
+                    self.execute(
+                        &self.matvec_i4_grouped,
+                        &[
+                            &encoded_buffer,
+                            &scales_buffer,
+                            &input_buffer,
+                            &output_buffer,
+                            &columns_buffer,
+                            &scale_columns_buffer,
+                            &group_size_buffer,
+                        ],
+                        rows,
+                        rows.min(REDUCTION_THREADS),
+                    )?;
+                }
             }
             copy_buffer(&output_buffer, output);
             Ok(())
@@ -1611,6 +1789,66 @@ mod implementation {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum U8MatrixEncoding {
+        Int8Row,
+        Int4Grouped {
+            group_size: usize,
+            scale_columns: usize,
+        },
+    }
+
+    fn u8_matrix_encoding(
+        rows: usize,
+        columns: usize,
+        encoded_length: usize,
+        scale_length: usize,
+    ) -> Result<U8MatrixEncoding, MetalError> {
+        let int8_bytes = rows.checked_mul(columns).ok_or(MetalError::Overflow)?;
+        let row_scale_bytes = rows.checked_mul(4).ok_or(MetalError::Overflow)?;
+        if encoded_length == int8_bytes && scale_length == row_scale_bytes {
+            return Ok(U8MatrixEncoding::Int8Row);
+        }
+
+        let int4_bytes = rows
+            .checked_mul(columns.div_ceil(2))
+            .ok_or(MetalError::Overflow)?;
+        if encoded_length != int4_bytes {
+            return Err(MetalError::InvalidByteLength {
+                kind: "U8 quantized matrix",
+                expected: int4_bytes,
+                actual: encoded_length,
+            });
+        }
+        if scale_length == row_scale_bytes {
+            return Ok(U8MatrixEncoding::Int4Grouped {
+                group_size: columns.max(1),
+                scale_columns: 1,
+            });
+        }
+        for group_size in [16, 32, 48, 64, 96, 128, 192, 256] {
+            if group_size > columns {
+                break;
+            }
+            let scale_columns = columns.div_ceil(group_size);
+            let expected = rows
+                .checked_mul(scale_columns)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or(MetalError::Overflow)?;
+            if scale_length == expected {
+                return Ok(U8MatrixEncoding::Int4Grouped {
+                    group_size,
+                    scale_columns,
+                });
+            }
+        }
+        Err(MetalError::InvalidByteLength {
+            kind: "U8 quantization scales",
+            expected: row_scale_bytes,
+            actual: scale_length,
+        })
+    }
+
     fn checked_mapped_range(
         mapping: &MetalMappedBuffer,
         offset: usize,
@@ -2070,6 +2308,100 @@ mod implementation {
                 .unwrap();
             assert_close(&fp8_output[..128], &vec![265.0; 128], 1e-5);
             assert!((fp8_output[128] - 661.0).abs() < 1e-5);
+        }
+
+        #[test]
+        fn mapped_and_owned_u8_quantized_matvecs_match_reference_values() {
+            let context = MetalContext::new().unwrap();
+            let int8 = vec![(-127_i8) as u8, 0, 127, (-2_i8) as u8, 3, 4];
+            let int8_scales = [0.1_f32, 0.5];
+            let int4 = vec![0x99_u8; 2 * 17];
+            let int4_scales = [1.0_f32, 2.0, 4.0, 0.5, 1.0, 2.0];
+            let int8_offset = 33;
+            let int8_scale_offset = int8_offset + int8.len() + 5;
+            let int4_offset = int8_scale_offset + int8_scales.len() * 4 + 7;
+            let int4_scale_offset = int4_offset + int4.len() + 3;
+            let mut contents = vec![0_u8; int4_scale_offset + int4_scales.len() * 4];
+            contents[int8_offset..int8_offset + int8.len()].copy_from_slice(&int8);
+            for (target, scale) in contents
+                [int8_scale_offset..int8_scale_offset + int8_scales.len() * 4]
+                .chunks_exact_mut(4)
+                .zip(int8_scales)
+            {
+                target.copy_from_slice(&scale.to_le_bytes());
+            }
+            contents[int4_offset..int4_offset + int4.len()].copy_from_slice(&int4);
+            for (target, scale) in contents
+                [int4_scale_offset..int4_scale_offset + int4_scales.len() * 4]
+                .chunks_exact_mut(4)
+                .zip(int4_scales)
+            {
+                target.copy_from_slice(&scale.to_le_bytes());
+            }
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&contents).unwrap();
+            file.flush().unwrap();
+            // SAFETY: the temporary file remains immutable for the mapping lifetime.
+            let mapping = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+            let mapped = context.map_read_only(mapping).unwrap();
+
+            let input8 = [1.0, 2.0, -1.0];
+            let mut output8 = [0.0; 2];
+            context
+                .matvec_safetensor_mapped(
+                    SafeDtype::U8,
+                    2,
+                    3,
+                    &mapped,
+                    int8_offset,
+                    int8.len(),
+                    Some((&mapped, int8_scale_offset, int8_scales.len() * 4)),
+                    &input8,
+                    &mut output8,
+                )
+                .unwrap();
+            assert_close(&output8, &[-25.4, 0.0], 1e-5);
+            context
+                .matvec_safetensor(
+                    SafeDtype::U8,
+                    2,
+                    3,
+                    &int8,
+                    Some(&int8_scales),
+                    &input8,
+                    &mut output8,
+                )
+                .unwrap();
+            assert_close(&output8, &[-25.4, 0.0], 1e-5);
+
+            let input4 = vec![1.0; 33];
+            let mut output4 = [0.0; 2];
+            context
+                .matvec_safetensor_mapped(
+                    SafeDtype::U8,
+                    2,
+                    33,
+                    &mapped,
+                    int4_offset,
+                    int4.len(),
+                    Some((&mapped, int4_scale_offset, int4_scales.len() * 4)),
+                    &input4,
+                    &mut output4,
+                )
+                .unwrap();
+            assert_close(&output4, &[52.0, 26.0], 1e-5);
+            context
+                .matvec_safetensor(
+                    SafeDtype::U8,
+                    2,
+                    33,
+                    &int4,
+                    Some(&int4_scales),
+                    &input4,
+                    &mut output4,
+                )
+                .unwrap();
+            assert_close(&output4, &[52.0, 26.0], 1e-5);
         }
 
         #[test]
