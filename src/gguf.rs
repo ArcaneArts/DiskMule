@@ -212,6 +212,20 @@ impl MetadataArray {
             _ => None,
         }
     }
+
+    pub fn as_f32s(&self) -> Option<&[f32]> {
+        match self {
+            Self::F32(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn as_bools(&self) -> Option<&[bool]> {
+        match self {
+            Self::Bool(values) => Some(values),
+            _ => None,
+        }
+    }
 }
 
 impl MetadataValue {
@@ -232,6 +246,20 @@ impl MetadataValue {
     pub fn as_array(&self) -> Option<&MetadataArray> {
         match self {
             Self::ArrayValues(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::F32(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
             _ => None,
         }
     }

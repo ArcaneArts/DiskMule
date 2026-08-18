@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod cpu;
 pub mod error;
+pub mod gemma4;
 pub mod gguf;
 pub mod model;
 pub mod server;

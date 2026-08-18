@@ -8,7 +8,12 @@ use std::{
 use serde::Deserialize;
 use tempfile::TempDir;
 
-use diskmule::gguf::{MetadataArray, MetadataValue, TensorSource};
+use diskmule::{
+    gemma4::{
+        ChatMessage, ChatRole, Gemma4Config, Gemma4Tokenizer, RUNTIME_ARRAY_KEYS, render_chat,
+    },
+    gguf::TensorSource,
+};
 
 const MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 
@@ -40,16 +45,46 @@ fn installed_gemma_is_listed_inspected_and_protected() {
     let before = fingerprint(&blob);
     let isolated_home = TempDir::new().unwrap();
 
-    let source = TensorSource::open_with_arrays(&blob, ["tokenizer.ggml.tokens"]).unwrap();
+    let mut source = TensorSource::open_with_arrays(&blob, RUNTIME_ARRAY_KEYS).unwrap();
     assert_eq!(source.gguf.architecture(), Some("gemma4"));
-    let tokens = source
-        .gguf
-        .metadata
-        .get("tokenizer.ggml.tokens")
-        .and_then(MetadataValue::as_array)
-        .and_then(MetadataArray::as_strings)
-        .expect("Gemma GGUF should expose its tokenizer vocabulary");
-    assert_eq!(tokens.len(), 262_144);
+    let config = Gemma4Config::from_gguf(&source.gguf).unwrap();
+    assert_eq!(config.hidden_size, 2_816);
+    assert_eq!(
+        config
+            .sliding_layers
+            .iter()
+            .filter(|value| !**value)
+            .count(),
+        5
+    );
+    let tokenizer = Gemma4Tokenizer::take_from_gguf(&mut source.gguf).unwrap();
+    assert_eq!(tokenizer.vocab_size(), 262_144);
+    assert_eq!(tokenizer.bos_id, 2);
+    assert_eq!(tokenizer.stop_token_ids, [1, 50, 106].into());
+
+    for prompt in [
+        "The capital of France is",
+        "Hello world\nSecond line",
+        "naïve 🦙",
+    ] {
+        let actual = tokenizer.encode(prompt, true);
+        if let Some(mut expected) = reference_tokenize(&blob, prompt) {
+            expected.insert(0, tokenizer.bos_id);
+            assert_eq!(actual, expected, "token mismatch for {prompt:?}");
+        }
+        assert_eq!(tokenizer.decode(&actual[1..], true), format!(" {prompt}"));
+    }
+    let chat = render_chat(&[
+        ChatMessage::new(ChatRole::System, "Be terse."),
+        ChatMessage::new(ChatRole::User, "Hello"),
+    ])
+    .unwrap();
+    let chat_tokens = tokenizer.encode(&chat, false);
+    if let Some(expected) = reference_tokenize(&blob, &chat) {
+        assert_eq!(chat_tokens, expected, "chat-template token mismatch");
+    }
+    assert_eq!(chat_tokens[0], tokenizer.bos_id);
+    assert!(chat_tokens.contains(&tokenizer.end_of_turn_id));
     let tensor_type_counts =
         source
             .gguf
@@ -137,6 +172,33 @@ fn diskmule<const N: usize>(home: &Path, arguments: [&str; N]) -> std::process::
         .env("DISKMULE_HOME", home)
         .output()
         .unwrap()
+}
+
+fn reference_tokenize(model: &Path, prompt: &str) -> Option<Vec<u32>> {
+    let mut command = Command::new("llama-tokenize");
+    command
+        .arg("--model")
+        .arg(model)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--ids")
+        .arg("--no-escape")
+        .arg("--no-bos")
+        .arg("--log-disable");
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping llama.cpp tokenizer comparison: llama-tokenize is unavailable");
+            return None;
+        }
+        Err(error) => panic!("could not run llama-tokenize: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "llama-tokenize failed: {}",
+        stderr(&output)
+    );
+    Some(serde_json::from_slice(&output.stdout).unwrap())
 }
 
 fn ollama_root() -> Option<PathBuf> {
