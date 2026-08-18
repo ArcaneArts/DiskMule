@@ -35,6 +35,252 @@ pub enum CpuError {
 
     #[error("matvec output has {actual} rows; expected {expected}")]
     InvalidOutputLength { expected: usize, actual: usize },
+
+    #[error("{operation} requires a non-empty input")]
+    EmptyInput { operation: &'static str },
+
+    #[error("{operation} {argument} has length {actual}; expected {expected}")]
+    InvalidVectorLength {
+        operation: &'static str,
+        argument: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("{operation} received a non-finite value")]
+    NonFinite { operation: &'static str },
+
+    #[error("top-k count {k} is outside 1..={length}")]
+    InvalidTopK { k: usize, length: usize },
+
+    #[error(
+        "NeoX RoPE input length {length} does not match {heads} heads of dimension {head_dimension}"
+    )]
+    InvalidRopeShape {
+        length: usize,
+        heads: usize,
+        head_dimension: usize,
+    },
+
+    #[error("NeoX RoPE requires an even head dimension and at most half its dimensions as pairs")]
+    InvalidRopePairs,
+
+    #[error("{operation} requires a finite positive parameter")]
+    InvalidPositiveParameter { operation: &'static str },
+}
+
+/// FP32 RMS normalization with an optional learned per-feature weight.
+pub fn rms_norm(
+    input: &[f32],
+    weight: Option<&[f32]>,
+    epsilon: f32,
+    output: &mut [f32],
+) -> Result<(), CpuError> {
+    if input.is_empty() {
+        return Err(CpuError::EmptyInput {
+            operation: "RMSNorm",
+        });
+    }
+    validate_vector_length("RMSNorm", "output", input.len(), output.len())?;
+    if let Some(weight) = weight {
+        validate_vector_length("RMSNorm", "weight", input.len(), weight.len())?;
+    }
+    if !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(CpuError::InvalidPositiveParameter {
+            operation: "RMSNorm epsilon",
+        });
+    }
+
+    let sum_squares = input
+        .iter()
+        .fold(0.0_f32, |sum, value| value.mul_add(*value, sum));
+    let inverse_rms = (sum_squares / input.len() as f32 + epsilon).sqrt().recip();
+    if !inverse_rms.is_finite() {
+        return Err(CpuError::NonFinite {
+            operation: "RMSNorm",
+        });
+    }
+    match weight {
+        Some(weight) => {
+            for ((output, input), weight) in output.iter_mut().zip(input).zip(weight) {
+                *output = input * weight * inverse_rms;
+            }
+        }
+        None => {
+            for (output, input) in output.iter_mut().zip(input) {
+                *output = input * inverse_rms;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gemma 4's `gelu_pytorch_tanh` activation.
+pub fn gelu_tanh(value: f32) -> f32 {
+    const SQRT_TWO_OVER_PI: f32 = 0.797_884_6;
+    const CUBIC: f32 = 0.044_715;
+    0.5 * value * (1.0 + (SQRT_TWO_OVER_PI * (value + CUBIC * value.powi(3))).tanh())
+}
+
+/// Apply NeoX-convention rotary embeddings to contiguous attention heads.
+pub fn rope_neox_in_place(
+    values: &mut [f32],
+    heads: usize,
+    head_dimension: usize,
+    rotated_pairs: usize,
+    position: usize,
+    theta: f32,
+) -> Result<(), CpuError> {
+    if heads
+        .checked_mul(head_dimension)
+        .filter(|length| *length == values.len())
+        .is_none()
+    {
+        return Err(CpuError::InvalidRopeShape {
+            length: values.len(),
+            heads,
+            head_dimension,
+        });
+    }
+    if !head_dimension.is_multiple_of(2) || rotated_pairs > head_dimension / 2 {
+        return Err(CpuError::InvalidRopePairs);
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(CpuError::InvalidPositiveParameter {
+            operation: "NeoX RoPE theta",
+        });
+    }
+
+    let half_dimension = head_dimension / 2;
+    for head in values.chunks_exact_mut(head_dimension) {
+        for pair in 0..rotated_pairs {
+            let exponent = -((2 * pair) as f32) / head_dimension as f32;
+            let angle = position as f32 * theta.powf(exponent);
+            let (sin, cos) = angle.sin_cos();
+            let first = head[pair];
+            let second = head[half_dimension + pair];
+            head[pair] = first * cos - second * sin;
+            head[half_dimension + pair] = first * sin + second * cos;
+        }
+    }
+    Ok(())
+}
+
+/// Numerically stable in-place softmax.
+pub fn softmax_in_place(values: &mut [f32]) -> Result<(), CpuError> {
+    if values.is_empty() {
+        return Err(CpuError::EmptyInput {
+            operation: "softmax",
+        });
+    }
+    if values
+        .iter()
+        .any(|value| value.is_nan() || *value == f32::INFINITY)
+    {
+        return Err(CpuError::NonFinite {
+            operation: "softmax",
+        });
+    }
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if maximum == f32::NEG_INFINITY {
+        return Err(CpuError::NonFinite {
+            operation: "softmax",
+        });
+    }
+    let mut sum = 0.0_f32;
+    for value in values.iter_mut() {
+        *value = (*value - maximum).exp();
+        sum += *value;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err(CpuError::NonFinite {
+            operation: "softmax",
+        });
+    }
+    for value in values {
+        *value /= sum;
+    }
+    Ok(())
+}
+
+/// Select the largest logits and normalize only the selected values.
+/// Equal logits are ordered by ascending original index.
+pub fn top_k_softmax(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, CpuError> {
+    if k == 0 || k > logits.len() {
+        return Err(CpuError::InvalidTopK {
+            k,
+            length: logits.len(),
+        });
+    }
+    if logits.iter().any(|value| !value.is_finite()) {
+        return Err(CpuError::NonFinite {
+            operation: "top-k softmax",
+        });
+    }
+    let mut selected: Vec<_> = logits.iter().copied().enumerate().collect();
+    selected.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    selected.truncate(k);
+    let mut probabilities: Vec<_> = selected.iter().map(|(_, value)| *value).collect();
+    softmax_in_place(&mut probabilities)?;
+    for ((_, value), probability) in selected.iter_mut().zip(probabilities) {
+        *value = probability;
+    }
+    Ok(selected)
+}
+
+/// Apply Gemma's bounded final-logit transform in place.
+pub fn softcap_in_place(values: &mut [f32], cap: f32) -> Result<(), CpuError> {
+    if !cap.is_finite() || cap <= 0.0 {
+        return Err(CpuError::InvalidPositiveParameter {
+            operation: "logit softcap",
+        });
+    }
+    for value in values {
+        *value = cap * (*value / cap).tanh();
+    }
+    Ok(())
+}
+
+/// Return the first maximum, matching deterministic greedy decoding.
+pub fn argmax(values: &[f32]) -> Result<usize, CpuError> {
+    if values.is_empty() {
+        return Err(CpuError::EmptyInput {
+            operation: "argmax",
+        });
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(CpuError::NonFinite {
+            operation: "argmax",
+        });
+    }
+    Ok(values
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0)))
+        .expect("non-empty input")
+        .0)
+}
+
+fn validate_vector_length(
+    operation: &'static str,
+    argument: &'static str,
+    expected: usize,
+    actual: usize,
+) -> Result<(), CpuError> {
+    if actual != expected {
+        return Err(CpuError::InvalidVectorLength {
+            operation,
+            argument,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 /// Decode GGML tensor blocks into FP32 values.
@@ -239,7 +485,10 @@ fn f16_to_f32(value: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuError, dequantize, matvec, scale_min_q4_k};
+    use super::{
+        CpuError, argmax, dequantize, gelu_tanh, matvec, rms_norm, rope_neox_in_place,
+        scale_min_q4_k, softcap_in_place, softmax_in_place, top_k_softmax,
+    };
     use crate::gguf::TensorType;
 
     #[test]
@@ -347,6 +596,63 @@ mod tests {
         assert!(matches!(
             dequantize(TensorType::Q5K, &[], &mut []),
             Err(CpuError::UnsupportedType("Q5_K"))
+        ));
+    }
+
+    #[test]
+    fn normalizes_weighted_and_unweighted_vectors() {
+        let input = [3.0_f32, 4.0];
+        let mut output = [0.0; 2];
+        rms_norm(&input, None, 1e-6, &mut output).unwrap();
+        let inverse_rms = (12.5_f32 + 1e-6).sqrt().recip();
+        assert_eq!(output, [3.0 * inverse_rms, 4.0 * inverse_rms]);
+
+        rms_norm(&input, Some(&[2.0, 0.5]), 1e-6, &mut output).unwrap();
+        assert_eq!(output, [6.0 * inverse_rms, 2.0 * inverse_rms]);
+        assert!(matches!(
+            rms_norm(&input, Some(&[1.0]), 1e-6, &mut output),
+            Err(CpuError::InvalidVectorLength {
+                argument: "weight",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn applies_gemma_gelu_and_logit_softcap() {
+        assert_eq!(gelu_tanh(0.0), 0.0);
+        assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-6);
+        let mut logits = [-60.0_f32, 0.0, 60.0];
+        softcap_in_place(&mut logits, 30.0).unwrap();
+        assert!((logits[0] + 28.920_826).abs() < 1e-5);
+        assert_eq!(logits[1], 0.0);
+        assert!((logits[2] - 28.920_826).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rotates_neox_pairs_and_leaves_the_remainder() {
+        let mut values = [1.0_f32, 2.0, 3.0, 4.0];
+        rope_neox_in_place(&mut values, 1, 4, 1, 1, 1.0).unwrap();
+        let (sin, cos) = 1.0_f32.sin_cos();
+        assert!((values[0] - (cos - 3.0 * sin)).abs() < 1e-6);
+        assert_eq!(values[1], 2.0);
+        assert!((values[2] - (sin + 3.0 * cos)).abs() < 1e-6);
+        assert_eq!(values[3], 4.0);
+    }
+
+    #[test]
+    fn softmax_and_top_k_are_stable_and_deterministic() {
+        let mut probabilities = [1_000.0_f32, 999.0, f32::NEG_INFINITY];
+        softmax_in_place(&mut probabilities).unwrap();
+        assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(probabilities[2], 0.0);
+
+        let selected = top_k_softmax(&[2.0, 3.0, 3.0, 0.0], 2).unwrap();
+        assert_eq!(selected, [(1, 0.5), (2, 0.5)]);
+        assert_eq!(argmax(&[1.0, 4.0, 4.0]).unwrap(), 1);
+        assert!(matches!(
+            top_k_softmax(&[1.0], 0),
+            Err(CpuError::InvalidTopK { .. })
         ));
     }
 }
