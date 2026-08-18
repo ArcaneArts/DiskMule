@@ -187,15 +187,7 @@ impl Glm52CpuModel {
             return Err(Glm52CpuError::ContextExceeded { maximum: 0 });
         }
         let tokenizer = Glm52Tokenizer::from_directory(directory)?;
-        if tokenizer.vocabulary_size() != config.vocabulary_size {
-            return Err(Glm52CpuError::Tokenizer(Glm52TokenizerError::Unsupported(
-                format!(
-                    "tokenizer has {} IDs but config declares {}",
-                    tokenizer.vocabulary_size(),
-                    config.vocabulary_size
-                ),
-            )));
-        }
+        tokenizer.validate_model_vocabulary(config.vocabulary_size)?;
         let source = SafeTensorSource::open_with_cache_policy(directory, glm_read_cache_policy()?)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
         if !weights.dsa_enabled {
@@ -307,6 +299,7 @@ impl Glm52CpuModel {
             let mut stopped = false;
             for generation_index in 0..maximum_new_tokens {
                 cancellation.check()?;
+                self.tokenizer.mask_undefined_logits(&mut logits)?;
                 let next = select(&logits)?;
                 if next as usize >= logits.len() {
                     return Err(RuntimeError::InvalidToken {

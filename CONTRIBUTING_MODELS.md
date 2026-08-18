@@ -109,7 +109,7 @@ cargo test --release --test qwen35_server_reference -- --ignored --nocapture
 | Contract | Gemma 4 | GLM-5.2 | Qwen 3.5/Qwen3.8 |
 | --- | --- | --- | --- |
 | Container | GGUF | sharded safetensors (FP8 or Colibri flat-U8) | GGUF |
-| CPU reference | Real pinned model | deterministic full-graph fixture | deterministic full-graph fixture |
+| CPU reference | Real pinned model | real metadata/tokenizer oracle; deterministic full-graph fixture | deterministic full-graph fixture |
 | Metal | full graph, real parity | FP8/INT8/grouped-INT4 matrix and expert offload, fixture parity | matrix offload, real token oracle |
 | Persistent state | KV | MLA KV + DSA history | recurrent + convolution + KV |
 | Residency | mapped or explicit expert LRU | explicit expert LRU | mapped |

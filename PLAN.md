@@ -329,6 +329,16 @@ contains no DSA indexer tensors. DiskMule therefore treats the indexer sidecar a
 strictly all-or-none: a completely absent sidecar uses exact dense attention,
 matching Colibri's behavior, while a partial sidecar is rejected.
 
+The recommended checkpoint's real 19 MB tokenizer and configuration metadata
+at revision `fd9b461ac7cae4b921470d0db12230c6505bd03c` also pass a pinned
+metadata-only oracle. DiskMule matches Hugging Face `tokenizers` 0.21.1 exactly
+across ordinary text, Unicode, whitespace, contractions, punctuation, special
+tokens, and the complete chat envelope. This audit found that the checkpoint
+correctly pads its embedding/logit vocabulary to 154,880 rows while defining
+tokenizer IDs only through 154,855. The loader now accepts that strict subset
+and masks undefined padded rows before sampling instead of rejecting the valid
+checkpoint or attempting to decode undefined IDs.
+
 Acquisition audit on 2026-08-18: the official `zai-org/GLM-5.2-FP8` repository
 reports `761,025,363,709` bytes (about 709 GiB), which cannot fit in the current
 474 GiB of free space. The recommended

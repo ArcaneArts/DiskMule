@@ -184,6 +184,17 @@ attention. DiskMule accepts only the complete sidecar or none of it, rejecting
 partial indexer state that could otherwise change long-context behavior
 silently.
 
+The real tokenizer/config metadata at recommended repository revision
+`fd9b461ac7cae4b921470d0db12230c6505bd03c` was downloaded separately from
+the tensor payload and compared with Hugging Face `tokenizers` 0.21.1. Exact
+IDs match for ASCII, multilingual Unicode, whitespace, contractions,
+punctuation, special-token literals, and the complete chat envelope. The audit
+also exposed an intentional padded-vocabulary distinction: `config.json`
+declares 154,880 embedding/logit rows, while `tokenizer.json` defines the
+contiguous IDs 0–154,855. DiskMule accepts tokenizer IDs that are a strict
+subset of model rows and masks the 24 undefined padded logits before sampling.
+It still rejects any tokenizer ID outside the model vocabulary.
+
 On Metal, dense tensors remain in retained no-copy whole-shard mappings.
 Safetensors payload offsets are not assumed to be naturally aligned: F32, F16,
 and BF16 kernels reconstruct little-endian values from bytes, avoiding silent

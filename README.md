@@ -249,9 +249,18 @@ The expensive pinned correctness oracle is separate from the fast gate:
 cargo test --release --test gemma4_cpu_reference -- --ignored --nocapture
 cargo test --release --test gemma4_metal_reference -- --ignored --nocapture
 cargo test --release --test gemma4_server_reference -- --ignored --nocapture
+DISKMULE_GLM52_METADATA=/path/to/glm-metadata \
+  cargo test --test glm52_tokenizer_reference -- --ignored --nocapture
 cargo test --release --test qwen35_reference -- --ignored --nocapture
 cargo test --release --test qwen35_server_reference -- --ignored --nocapture
 ```
+
+The GLM metadata oracle needs only `config.json`, `generation_config.json`,
+`tokenizer.json`, and `tokenizer_config.json` from recommended Colibri revision
+`fd9b461ac7cae4b921470d0db12230c6505bd03c`; it does not download or open tensor
+shards. It pins exact Hugging Face tokenizer IDs and validates the checkpoint's
+154,880-row padded model vocabulary against its 154,856 defined tokenizer IDs.
+Undefined padded output rows are excluded from sampling.
 
 For GGUF digest
 `7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, it

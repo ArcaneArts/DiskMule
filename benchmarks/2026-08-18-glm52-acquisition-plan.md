@@ -12,7 +12,8 @@ Use
 [`mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp)
 for the first full-model run. DiskMule implements its ordinary-decode row-INT8
 and grouped-INT4/gs64 layouts without wrapping Colibri or converting precision
-at load time.
+at load time. The audited repository revision is
+`fd9b461ac7cae4b921470d0db12230c6505bd03c`.
 
 The Hugging Face model API reported this inventory on 2026-08-18:
 
@@ -43,6 +44,21 @@ sidecar is acquired later.
 MTP is deliberately excluded from the first acquisition and validation.
 Ordinary decode must be correct and profiled before DiskMule adds or claims MTP.
 
+The four small JSON metadata files were acquired independently and validated
+before any tensor download. Their SHA-256 digests at the audited revision are:
+
+| File | SHA-256 |
+| --- | --- |
+| `config.json` | `22e49334abf8562fecf70ca3292ba3f5b33f5602fb2bf10b52dd64a66cfe65ff` |
+| `generation_config.json` | `ac76b43d8683d3b930126870fc8be73d8679308fe752fa1f381096d8354f6a55` |
+| `tokenizer.json` | `19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d` |
+| `tokenizer_config.json` | `98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc` |
+
+The 19 MB tokenizer matches Hugging Face `tokenizers` 0.21.1 on the pinned
+oracle corpus and chat envelope. Its ID space ends at 154,855 even though the
+model matrices are padded to 154,880 rows. DiskMule validates that strict
+subset and masks the 24 undefined model rows before sampling.
+
 The experimental
 [`mastouri/GLM-5.2-colibri-E8-IQ3-with-int8-mtp`](https://huggingface.co/mastouri/GLM-5.2-colibri-E8-IQ3-with-int8-mtp)
 alternative reports 299,042,372,874 bytes total. Its 140 ordinary shards are
@@ -69,7 +85,9 @@ as grouped INT4 merely because it also uses flat U8 storage.
 
 1. Run `diskmule ls` and open the snapshot metadata. This must index all shards
    and validate the complete GLM tensor contract without reading payloads.
-2. Run tokenizer and chat-template fixtures against the checkpoint metadata.
+2. Verify the metadata digests above, then run the real tokenizer/chat oracle:
+   `DISKMULE_GLM52_METADATA=/path/to/snapshot cargo test --test
+   glm52_tokenizer_reference -- --ignored --nocapture`.
 3. Generate one greedy token through the CPU reference and retain token ID,
    logits summary, timings, and tensor/cache byte counters. CPU is a correctness
    oracle, not a throughput target.

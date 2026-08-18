@@ -343,6 +343,39 @@ impl Glm52Tokenizer {
         self.decoded.len()
     }
 
+    /// Rejects a tokenizer whose highest defined ID cannot index the model's
+    /// embedding and output matrices.
+    ///
+    /// GLM checkpoints may pad those matrices beyond the tokenizer's final
+    /// defined ID, so equality is intentionally not required.
+    pub fn validate_model_vocabulary(
+        &self,
+        model_vocabulary_size: usize,
+    ) -> Result<(), Glm52TokenizerError> {
+        if self.vocabulary_size() > model_vocabulary_size {
+            return Err(Glm52TokenizerError::Unsupported(format!(
+                "tokenizer ID space has {} entries but the model declares only {model_vocabulary_size}",
+                self.vocabulary_size()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prevents sampling IDs that have model logits but no tokenizer entry.
+    ///
+    /// This covers both internal tokenizer gaps and padded model-vocabulary
+    /// rows. The logits retain their model-declared length for selectors and
+    /// correctness oracles.
+    pub fn mask_undefined_logits(&self, logits: &mut [f32]) -> Result<(), Glm52TokenizerError> {
+        self.validate_model_vocabulary(logits.len())?;
+        for (id, logit) in logits.iter_mut().enumerate() {
+            if self.decoded.get(id).is_none_or(Option::is_none) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        Ok(())
+    }
+
     pub fn token_id(&self, text: &str) -> Option<u32> {
         self.added
             .iter()
@@ -630,6 +663,28 @@ mod tests {
             "[gMASK]<sop><|system|>Be terse.<|user|>Hi<|assistant|><think></think>Hello<|user|>Again<|assistant|><think></think>"
         );
         assert!(render_chat(&messages, true).ends_with("<|assistant|><think>"));
+    }
+
+    #[test]
+    fn accepts_padded_model_vocabularies_and_masks_undefined_ids() {
+        let temp = TempDir::new().unwrap();
+        write_tokenizer(temp.path());
+        let tokenizer = Glm52Tokenizer::from_directory(temp.path()).unwrap();
+        assert_eq!(tokenizer.vocabulary_size(), 311);
+        tokenizer.validate_model_vocabulary(320).unwrap();
+        assert!(tokenizer.validate_model_vocabulary(310).is_err());
+
+        let mut logits = vec![1.0; 320];
+        tokenizer.mask_undefined_logits(&mut logits).unwrap();
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[255], 1.0);
+        assert_eq!(logits[256], f32::NEG_INFINITY);
+        assert_eq!(logits[299], f32::NEG_INFINITY);
+        assert_eq!(logits[300], 1.0);
+        assert_eq!(logits[309], f32::NEG_INFINITY);
+        assert_eq!(logits[310], 1.0);
+        assert_eq!(logits[311], f32::NEG_INFINITY);
+        assert_eq!(logits[319], f32::NEG_INFINITY);
     }
 
     fn write_tokenizer(directory: &std::path::Path) {
