@@ -2,12 +2,14 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gguf;
+pub mod model;
 
 use std::io::Write;
 
 use cli::{Action, Cli};
 use config::Paths;
 use error::{AppError, Result};
+use model::{ModelCatalog, format_size};
 
 /// Runs one parsed DiskMule command.
 ///
@@ -24,17 +26,36 @@ pub fn execute(cli: &Cli, paths: &Paths, output: &mut impl Write) -> Result<()> 
             context: model.to_owned(),
         }),
         Action::List => {
+            let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;
             writeln!(
                 output,
-                "No models listed yet (managed root: {}).",
-                paths.models.display()
+                "NAME\tARCHITECTURE\tQUANTIZATION\tSIZE\tSOURCE\tSTATUS"
+            )?;
+            for record in catalog.records() {
+                writeln!(
+                    output,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    record.name,
+                    record.architecture.as_deref().unwrap_or("-"),
+                    record.quantization.as_deref().unwrap_or("-"),
+                    record.size.map(format_size).as_deref().unwrap_or("-"),
+                    record.source,
+                    record.compatibility
+                )?;
+            }
+            Ok(())
+        }
+        Action::Remove { model } => {
+            let mut catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;
+            let removed = catalog.remove(model, &Default::default())?;
+            writeln!(
+                output,
+                "Removed {} ({}).",
+                removed.name,
+                removed.path.display()
             )?;
             Ok(())
         }
-        Action::Remove { model } => Err(AppError::NotImplementedWithContext {
-            operation: "model removal",
-            context: model.to_owned(),
-        }),
     }
 }
 

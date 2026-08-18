@@ -1,10 +1,11 @@
 use std::{env, ffi::OsStr, path::PathBuf};
 
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 
 use crate::error::{AppError, Result};
 
 pub const HOME_ENV: &str = "DISKMULE_HOME";
+pub const OLLAMA_MODELS_ENV: &str = "OLLAMA_MODELS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -42,6 +43,16 @@ impl Paths {
             registry: root.join("registry.json"),
             root,
         }
+    }
+}
+
+pub fn ollama_models_dir() -> Result<Option<PathBuf>> {
+    match env::var_os(OLLAMA_MODELS_ENV) {
+        Some(root) if root.is_empty() => Err(AppError::InvalidConfiguration(format!(
+            "{OLLAMA_MODELS_ENV} cannot be empty"
+        ))),
+        Some(root) => Ok(Some(PathBuf::from(root))),
+        None => Ok(BaseDirs::new().map(|base| base.home_dir().join(".ollama/models"))),
     }
 }
 
