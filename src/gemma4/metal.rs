@@ -4,9 +4,10 @@ use std::{path::Path, time::Instant};
 
 use crate::{
     cpu::{tensor_row, tensor_vector},
+    expert::{ExpertCache, ExpertCacheError, ExpertCacheStats, ExpertLayerLayout},
     gemma4::{Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS},
     gguf::TensorSource,
-    metal::{MetalContext, MetalKvLayer, MetalMappedBuffer},
+    metal::{MetalContext, MetalKvLayer, MetalMappedBuffer, MetalOwnedBuffer},
 };
 
 use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError};
@@ -15,6 +16,15 @@ use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeE
 pub struct MetalKvCache {
     layers: Vec<MetalKvLayer>,
     max_context: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExpertResidency {
+    #[default]
+    Mapped,
+    Streamed {
+        slots_per_layer: usize,
+    },
 }
 
 impl MetalKvCache {
@@ -70,12 +80,21 @@ pub struct Gemma4MetalModel {
     pub weights: Gemma4Weights,
     metal: MetalContext,
     mapped_weights: MetalMappedBuffer,
+    expert_residency: ExpertResidency,
     max_context: usize,
     full_rope_pairs: usize,
 }
 
 impl Gemma4MetalModel {
     pub fn open(path: impl AsRef<Path>, max_context: usize) -> Result<Self, RuntimeError> {
+        Self::open_with_expert_residency(path, max_context, ExpertResidency::Mapped)
+    }
+
+    pub fn open_with_expert_residency(
+        path: impl AsRef<Path>,
+        max_context: usize,
+        expert_residency: ExpertResidency,
+    ) -> Result<Self, RuntimeError> {
         let mut source = TensorSource::open_with_arrays(path, RUNTIME_ARRAY_KEYS)?;
         let config = Gemma4Config::from_gguf(&source.gguf)?;
         let weights = Gemma4Weights::from_gguf(&source.gguf, &config)?;
@@ -109,6 +128,7 @@ impl Gemma4MetalModel {
             weights,
             metal,
             mapped_weights,
+            expert_residency,
             max_context,
             full_rope_pairs,
         })
@@ -120,6 +140,10 @@ impl Gemma4MetalModel {
 
     pub fn device_name(&self) -> String {
         self.metal.device_name()
+    }
+
+    pub fn expert_residency(&self) -> ExpertResidency {
+        self.expert_residency
     }
 
     pub fn new_cache(&self) -> Result<MetalKvCache, RuntimeError> {
@@ -141,6 +165,33 @@ impl Gemma4MetalModel {
             layers,
             max_context: self.max_context,
         })
+    }
+
+    fn new_expert_cache(&self) -> Result<Option<ExpertCache>, RuntimeError> {
+        let ExpertResidency::Streamed { slots_per_layer } = self.expert_residency else {
+            return Ok(None);
+        };
+        let mut layouts = Vec::with_capacity(self.weights.layers.len());
+        for layer in &self.weights.layers {
+            let gate_up = &self.source.gguf.tensors[layer.expert_gate_up];
+            let down = &self.source.gguf.tensors[layer.expert_down];
+            let expert_count = self.config.expert_count as usize;
+            let gate_up_bytes = bytes_per_expert(gate_up.byte_len, expert_count, &gate_up.name)?;
+            let down_bytes = bytes_per_expert(down.byte_len, expert_count, &down.name)?;
+            layouts.push(ExpertLayerLayout {
+                expert_count,
+                gate_up_offset: gate_up.absolute_offset,
+                gate_up_bytes,
+                down_offset: down.absolute_offset,
+                down_bytes,
+            });
+        }
+        Ok(Some(ExpertCache::new(
+            &self.metal,
+            self.source.shared_file(),
+            &layouts,
+            slots_per_layer,
+        )?))
     }
 
     pub fn generate_greedy<F>(
@@ -171,12 +222,19 @@ impl Gemma4MetalModel {
 
         let started = Instant::now();
         let mut cache = self.new_cache()?;
+        let mut expert_cache = self.new_expert_cache()?;
         let mut profile = GenerationProfile {
             prompt_tokens: prompt_tokens.len(),
             resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
-        let mut logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
+        let mut logits = self.prefill(
+            prompt_tokens,
+            &mut cache,
+            &mut expert_cache,
+            cancellation,
+            &mut profile,
+        )?;
         let mut generated = Vec::with_capacity(maximum_new_tokens);
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
@@ -196,6 +254,7 @@ impl Gemma4MetalModel {
                         next,
                         prompt_tokens.len() + generation_index,
                         &mut cache,
+                        &mut expert_cache,
                         true,
                         cancellation,
                         &mut profile,
@@ -203,6 +262,7 @@ impl Gemma4MetalModel {
                     .expect("decode requests logits");
             }
         }
+        record_expert_stats(&mut profile, expert_cache.as_ref().map(ExpertCache::stats));
         profile.total_time = started.elapsed();
         let text = self.tokenizer.decode(&generated, true);
         Ok(GenerationResult {
@@ -229,12 +289,20 @@ impl Gemma4MetalModel {
         }
         let started = Instant::now();
         let mut cache = self.new_cache()?;
+        let mut expert_cache = self.new_expert_cache()?;
         let mut profile = GenerationProfile {
             prompt_tokens: prompt_tokens.len(),
             resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
-        let logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
+        let logits = self.prefill(
+            prompt_tokens,
+            &mut cache,
+            &mut expert_cache,
+            cancellation,
+            &mut profile,
+        )?;
+        record_expert_stats(&mut profile, expert_cache.as_ref().map(ExpertCache::stats));
         profile.total_time = started.elapsed();
         Ok((logits, profile))
     }
@@ -243,6 +311,7 @@ impl Gemma4MetalModel {
         &self,
         prompt_tokens: &[u32],
         cache: &mut MetalKvCache,
+        expert_cache: &mut Option<ExpertCache>,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
     ) -> Result<Vec<f32>, RuntimeError> {
@@ -253,6 +322,7 @@ impl Gemma4MetalModel {
                 token,
                 position,
                 cache,
+                expert_cache,
                 position + 1 == prompt_tokens.len(),
                 cancellation,
                 profile,
@@ -261,11 +331,13 @@ impl Gemma4MetalModel {
         Ok(logits.expect("non-empty prefill produces final logits"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_token(
         &self,
         token: u32,
         position: usize,
         cache: &mut MetalKvCache,
+        expert_cache: &mut Option<ExpertCache>,
         produce_logits: bool,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
@@ -293,6 +365,7 @@ impl Gemma4MetalModel {
             token,
             position,
             cache,
+            expert_cache,
             produce_logits,
             cancellation,
             profile,
@@ -303,11 +376,13 @@ impl Gemma4MetalModel {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_token_inner(
         &self,
         token: u32,
         position: usize,
         cache: &mut MetalKvCache,
+        expert_cache: &mut Option<ExpertCache>,
         produce_logits: bool,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
@@ -453,31 +528,35 @@ impl Gemma4MetalModel {
             let mut routed = vec![0.0_f32; hidden_size];
             for (expert, probability) in selected {
                 cancellation.check()?;
-                let mut gate_up = vec![0.0_f32; expert_width * 2];
-                self.expert_matvec(
-                    layer.expert_gate_up,
-                    expert,
-                    &routed_input,
-                    &mut gate_up,
-                    profile,
-                )?;
-                let (gate, up) = gate_up.split_at(expert_width);
-                let mut activated = vec![0.0_f32; expert_width];
-                self.metal.gelu_mul(gate, up, &mut activated)?;
-                self.require_finite_activation(
-                    &format!("layer {layer_index} expert {expert} GELU"),
-                    gate,
-                    up,
-                    &activated,
-                )?;
-                let mut expert_output = vec![0.0_f32; hidden_size];
-                self.expert_matvec(
-                    layer.expert_down,
-                    expert,
-                    &activated,
-                    &mut expert_output,
-                    profile,
-                )?;
+                let expert_output = if let Some(cache) = expert_cache.as_mut() {
+                    cache.with_expert(
+                        layer_index,
+                        expert,
+                        || cancellation.is_cancelled(),
+                        |gate_up_buffer, down_buffer| {
+                            self.streamed_expert(
+                                layer_index,
+                                expert,
+                                layer.expert_gate_up,
+                                layer.expert_down,
+                                gate_up_buffer,
+                                down_buffer,
+                                &routed_input,
+                                expert_width,
+                            )
+                        },
+                    )?
+                } else {
+                    self.mapped_expert(
+                        layer_index,
+                        expert,
+                        layer.expert_gate_up,
+                        layer.expert_down,
+                        &routed_input,
+                        expert_width,
+                        profile,
+                    )?
+                };
                 let scale = probability * expert_scale[expert];
                 for (output, expert_value) in routed.iter_mut().zip(expert_output) {
                     *output = expert_value.mul_add(scale, *output);
@@ -659,6 +738,105 @@ impl Gemma4MetalModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn mapped_expert(
+        &self,
+        layer: usize,
+        expert: usize,
+        gate_up_index: usize,
+        down_index: usize,
+        input: &[f32],
+        expert_width: usize,
+        profile: &mut GenerationProfile,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let mut gate_up = vec![0.0_f32; expert_width * 2];
+        self.expert_matvec(gate_up_index, expert, input, &mut gate_up, profile)?;
+        let (gate, up) = gate_up.split_at(expert_width);
+        let mut activated = vec![0.0_f32; expert_width];
+        self.metal.gelu_mul(gate, up, &mut activated)?;
+        self.require_finite_activation(
+            &format!("layer {layer} expert {expert} GELU"),
+            gate,
+            up,
+            &activated,
+        )?;
+        let mut output = vec![0.0_f32; self.config.hidden_size as usize];
+        self.expert_matvec(down_index, expert, &activated, &mut output, profile)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn streamed_expert(
+        &self,
+        layer: usize,
+        expert: usize,
+        gate_up_index: usize,
+        down_index: usize,
+        gate_up_buffer: &MetalOwnedBuffer,
+        down_buffer: &MetalOwnedBuffer,
+        input: &[f32],
+        expert_width: usize,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let mut gate_up = vec![0.0_f32; expert_width * 2];
+        self.expert_owned_matvec(gate_up_index, expert, gate_up_buffer, input, &mut gate_up)?;
+        let (gate, up) = gate_up.split_at(expert_width);
+        let mut activated = vec![0.0_f32; expert_width];
+        self.metal.gelu_mul(gate, up, &mut activated)?;
+        self.require_finite_activation(
+            &format!("layer {layer} expert {expert} streamed GELU"),
+            gate,
+            up,
+            &activated,
+        )?;
+        let mut output = vec![0.0_f32; self.config.hidden_size as usize];
+        self.expert_owned_matvec(down_index, expert, down_buffer, &activated, &mut output)?;
+        Ok(output)
+    }
+
+    fn expert_owned_matvec(
+        &self,
+        index: usize,
+        expert: usize,
+        encoded: &MetalOwnedBuffer,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), RuntimeError> {
+        let tensor = &self.source.gguf.tensors[index];
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalInput {
+                tensor: format!("{} expert {expert} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
+        let columns = dimension(tensor.dimensions[0])?;
+        let rows = dimension(tensor.dimensions[1])?;
+        let experts = dimension(tensor.dimensions[2])?;
+        if expert >= experts {
+            return Err(crate::cpu::CpuError::InvalidTensorExpert {
+                tensor: tensor.name.clone(),
+                expert,
+                experts,
+            }
+            .into());
+        }
+        let encoded_length = bytes_per_expert(tensor.byte_len, experts, &tensor.name)?;
+        self.metal.matvec_owned(
+            tensor.kind,
+            rows,
+            columns,
+            encoded,
+            0,
+            encoded_length,
+            input,
+            output,
+        )?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalTensor {
+                tensor: format!("{} expert {expert} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
+        Ok(())
+    }
+
     fn feed_forward(
         &self,
         input: &[f32],
@@ -714,6 +892,37 @@ impl Gemma4MetalModel {
 
 fn dimension(value: u64) -> Result<usize, RuntimeError> {
     usize::try_from(value).map_err(|_| crate::metal::MetalError::Overflow.into())
+}
+
+fn bytes_per_expert(
+    total_bytes: u64,
+    expert_count: usize,
+    tensor: &str,
+) -> Result<usize, RuntimeError> {
+    let expert_count_u64 = u64::try_from(expert_count).map_err(|_| {
+        ExpertCacheError::InvalidLayout(format!("{tensor} expert count does not fit u64"))
+    })?;
+    if expert_count == 0 || !total_bytes.is_multiple_of(expert_count_u64) {
+        return Err(ExpertCacheError::InvalidLayout(format!(
+            "{tensor} byte length {total_bytes} is not divisible by {expert_count} experts"
+        ))
+        .into());
+    }
+    usize::try_from(total_bytes / expert_count_u64)
+        .map_err(|_| crate::metal::MetalError::Overflow.into())
+}
+
+fn record_expert_stats(profile: &mut GenerationProfile, stats: Option<ExpertCacheStats>) {
+    let Some(stats) = stats else {
+        return;
+    };
+    profile.expert_cache_hits = stats.hits;
+    profile.expert_cache_misses = stats.misses;
+    profile.expert_cache_evictions = stats.evictions;
+    profile.expert_reads = stats.reads;
+    profile.expert_bytes_read = stats.bytes_read;
+    profile.expert_io_wait = stats.io_wait;
+    profile.expert_resident_bytes = stats.resident_bytes;
 }
 
 fn maximum_magnitude(values: &[f32]) -> f32 {

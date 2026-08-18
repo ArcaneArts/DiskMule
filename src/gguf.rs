@@ -664,6 +664,11 @@ impl TensorSource {
         Arc::clone(&self.mapping)
     }
 
+    /// Share the read-only descriptor with bounded positional-I/O backends.
+    pub fn shared_file(&self) -> Arc<File> {
+        Arc::clone(&self.file)
+    }
+
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensor_indices
             .get(name)

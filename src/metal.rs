@@ -201,6 +201,38 @@ mod implementation {
     }
 
     #[derive(Debug)]
+    pub struct MetalOwnedBuffer {
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        length: usize,
+    }
+
+    impl MetalOwnedBuffer {
+        pub fn len(&self) -> usize {
+            self.length
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.length == 0
+        }
+
+        pub fn as_bytes(&self) -> &[u8] {
+            // SAFETY: the retained shared buffer owns at least `length` bytes
+            // and the immutable borrow prevents simultaneous host mutation.
+            unsafe {
+                slice::from_raw_parts(self.buffer.contents().as_ptr().cast::<u8>(), self.length)
+            }
+        }
+
+        pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+            // SAFETY: the retained shared buffer owns at least `length` bytes,
+            // and the exclusive wrapper borrow prevents simultaneous host use.
+            unsafe {
+                slice::from_raw_parts_mut(self.buffer.contents().as_ptr().cast::<u8>(), self.length)
+            }
+        }
+    }
+
+    #[derive(Debug)]
     pub struct MetalKvLayer {
         keys: Retained<ProtocolObject<dyn MTLBuffer>>,
         values: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -337,6 +369,16 @@ mod implementation {
                 bytes: mapped_length,
             })?;
             Ok(MetalMappedBuffer { buffer, mapping })
+        }
+
+        pub fn new_owned_buffer(&self, length: usize) -> Result<MetalOwnedBuffer, MetalError> {
+            if length == 0 {
+                return Err(MetalError::BufferAllocation { bytes: 0 });
+            }
+            Ok(MetalOwnedBuffer {
+                buffer: self.empty_buffer::<u8>(length)?,
+                length,
+            })
         }
 
         pub fn add(
@@ -633,6 +675,55 @@ mod implementation {
             self.execute_with_first_offset(
                 pipeline,
                 &mapping.buffer,
+                encoded_offset,
+                &[
+                    &input_buffer,
+                    &output_buffer,
+                    &columns_buffer,
+                    &row_bytes_buffer,
+                ],
+                rows,
+                rows.min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn matvec_owned(
+            &self,
+            kind: TensorType,
+            rows: usize,
+            columns: usize,
+            encoded: &MetalOwnedBuffer,
+            encoded_offset: usize,
+            encoded_length: usize,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            let (pipeline, row_bytes) =
+                self.prepare_matvec(kind, rows, columns, encoded_length, input, output)?;
+            let end = encoded_offset
+                .checked_add(encoded_length)
+                .ok_or(MetalError::Overflow)?;
+            if end > encoded.len() {
+                return Err(MetalError::MappedRange {
+                    offset: encoded_offset,
+                    end,
+                    length: encoded.len(),
+                });
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("matvec", input)?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            let row_bytes_buffer = self.buffer_with_data(&[count_u32(row_bytes)?])?;
+            self.execute_with_first_offset(
+                pipeline,
+                &encoded.buffer,
                 encoded_offset,
                 &[
                     &input_buffer,
@@ -1606,7 +1697,7 @@ mod implementation {
 }
 
 #[cfg(target_os = "macos")]
-pub use implementation::{MetalContext, MetalKvLayer, MetalMappedBuffer};
+pub use implementation::{MetalContext, MetalKvLayer, MetalMappedBuffer, MetalOwnedBuffer};
 
 #[cfg(not(target_os = "macos"))]
 #[derive(Debug)]

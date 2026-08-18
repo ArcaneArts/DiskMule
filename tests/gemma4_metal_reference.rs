@@ -6,7 +6,7 @@ use diskmule::{
     cpu::argmax,
     gemma4::{
         cpu::{CancellationFlag, Gemma4CpuModel},
-        metal::Gemma4MetalModel,
+        metal::{ExpertResidency, Gemma4MetalModel},
     },
 };
 use serde::Deserialize;
@@ -98,6 +98,43 @@ fn greedy_metal_decode_matches_the_cpu_and_ollama_oracles() {
     assert_eq!(result.text.trim_start(), "hedron ownley own");
     assert_eq!(result.profile.prompt_tokens, 1);
     assert_eq!(result.profile.generated_tokens, 4);
+
+    let streamed = Gemma4MetalModel::open_with_expert_residency(
+        &blob,
+        8,
+        ExpertResidency::Streamed { slots_per_layer: 1 },
+    )
+    .unwrap();
+    let (streamed_logits, streamed_logits_profile) = streamed
+        .prompt_logits(&[streamed.tokenizer.bos_id], &cancellation)
+        .unwrap();
+    let streamed_maximum_error = metal_logits
+        .iter()
+        .zip(&streamed_logits)
+        .map(|(resident, streamed)| (resident - streamed).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!("maximum resident/streamed logit error: {streamed_maximum_error}");
+    eprintln!("DiskMule streamed logits profile: {streamed_logits_profile:#?}");
+    assert!(streamed_maximum_error < CPU_METAL_TOLERANCE);
+    assert!(streamed_logits_profile.expert_cache_misses > 0);
+    assert_eq!(
+        streamed_logits_profile.expert_reads,
+        streamed_logits_profile.expert_cache_misses * 2
+    );
+    assert!(streamed_logits_profile.expert_bytes_read > 0);
+    assert!(streamed_logits_profile.expert_io_wait > std::time::Duration::ZERO);
+    assert!(streamed_logits_profile.expert_resident_bytes > 0);
+    let streamed_result = streamed
+        .generate_greedy(
+            &[streamed.tokenizer.bos_id],
+            4,
+            &CancellationFlag::default(),
+            |_, _| {},
+        )
+        .unwrap();
+    eprintln!("DiskMule streamed profile: {:#?}", streamed_result.profile);
+    assert_eq!(streamed_result.token_ids, result.token_ids);
+    assert_eq!(streamed_result.text, result.text);
 }
 
 fn normalized_log_probability(logits: &[f32], index: usize) -> f32 {

@@ -21,6 +21,9 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::metal::MetalError;
 
+#[cfg(target_os = "macos")]
+use crate::expert::ExpertCacheError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error(transparent)]
@@ -35,6 +38,10 @@ pub enum RuntimeError {
     #[cfg(target_os = "macos")]
     #[error(transparent)]
     Metal(#[from] MetalError),
+
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    ExpertCache(#[from] ExpertCacheError),
 
     #[error("generation requires at least one prompt token")]
     EmptyPrompt,
@@ -97,6 +104,13 @@ pub struct GenerationProfile {
     pub generated_tokens: usize,
     pub mapped_bytes_touched: u64,
     pub resident_kv_bytes: u64,
+    pub expert_cache_hits: u64,
+    pub expert_cache_misses: u64,
+    pub expert_cache_evictions: u64,
+    pub expert_reads: u64,
+    pub expert_bytes_read: u64,
+    pub expert_io_wait: Duration,
+    pub expert_resident_bytes: u64,
     pub embedding_time: Duration,
     pub attention_time: Duration,
     pub feed_forward_time: Duration,

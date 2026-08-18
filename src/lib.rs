@@ -3,6 +3,8 @@ pub mod cli;
 pub mod config;
 pub mod cpu;
 pub mod error;
+#[cfg(target_os = "macos")]
+pub mod expert;
 pub mod gemma4;
 pub mod gguf;
 pub mod metal;
