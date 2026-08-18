@@ -36,6 +36,35 @@ pub enum MetalError {
     #[error("Metal vector length exceeds the 32-bit kernel limit")]
     VectorTooLarge,
 
+    #[error("{operation} requires a non-empty input")]
+    EmptyInput { operation: &'static str },
+
+    #[error("{operation} {argument} has length {actual}; expected {expected}")]
+    InvalidVectorLength {
+        operation: &'static str,
+        argument: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error(
+        "NeoX RoPE input length {length} does not match {heads} heads of dimension {head_dimension}"
+    )]
+    InvalidRopeShape {
+        length: usize,
+        heads: usize,
+        head_dimension: usize,
+    },
+
+    #[error("NeoX RoPE requires an even head dimension and at most half its dimensions as pairs")]
+    InvalidRopePairs,
+
+    #[error("{operation} requires a finite positive parameter")]
+    InvalidPositiveParameter { operation: &'static str },
+
+    #[error("{operation} received a non-finite value")]
+    NonFinite { operation: &'static str },
+
     #[error("could not create a Metal command buffer or compute encoder")]
     CommandEncoding,
 
@@ -65,6 +94,13 @@ mod implementation {
 
     const SHADERS: &str = include_str!("../metal/kernels.metal");
     const VECTOR_ADD: &str = "vector_add";
+    const RMS_NORM: &str = "rms_norm";
+    const ROPE_NEOX: &str = "rope_neox";
+    const GELU_MUL: &str = "gelu_mul";
+    const STABLE_SOFTMAX: &str = "stable_softmax";
+    const LOGIT_SOFTCAP: &str = "logit_softcap";
+    const DETERMINISTIC_ARGMAX: &str = "deterministic_argmax";
+    const REDUCTION_THREADS: usize = 256;
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {}
@@ -74,6 +110,12 @@ mod implementation {
         device: Retained<ProtocolObject<dyn MTLDevice>>,
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         vector_add: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        rms_norm: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        rope_neox: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        gelu_mul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        stable_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        logit_softcap: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        deterministic_argmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
     impl MetalContext {
@@ -85,10 +127,22 @@ mod implementation {
                 .newLibraryWithSource_options_error(&source, None)
                 .map_err(|error| MetalError::Library(error.to_string()))?;
             let vector_add = pipeline(&device, &library, VECTOR_ADD)?;
+            let rms_norm = pipeline(&device, &library, RMS_NORM)?;
+            let rope_neox = pipeline(&device, &library, ROPE_NEOX)?;
+            let gelu_mul = pipeline(&device, &library, GELU_MUL)?;
+            let stable_softmax = pipeline(&device, &library, STABLE_SOFTMAX)?;
+            let logit_softcap = pipeline(&device, &library, LOGIT_SOFTCAP)?;
+            let deterministic_argmax = pipeline(&device, &library, DETERMINISTIC_ARGMAX)?;
             Ok(Self {
                 device,
                 queue,
                 vector_add,
+                rms_norm,
+                rope_neox,
+                gelu_mul,
+                stable_softmax,
+                logit_softcap,
+                deterministic_argmax,
             })
         }
 
@@ -115,8 +169,212 @@ mod implementation {
             let count = u32::try_from(left.len()).map_err(|_| MetalError::VectorTooLarge)?;
             let left_buffer = self.buffer_with_data(left)?;
             let right_buffer = self.buffer_with_data(right)?;
-            let output_buffer = self.empty_buffer(output.len())?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
             let count_buffer = self.buffer_with_data(&[count])?;
+            self.execute(
+                &self.vector_add,
+                &[&left_buffer, &right_buffer, &output_buffer, &count_buffer],
+                left.len(),
+                left.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn rms_norm(
+            &self,
+            input: &[f32],
+            weight: Option<&[f32]>,
+            epsilon: f32,
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            require_nonempty("RMSNorm", input)?;
+            validate_vector_length("RMSNorm", "output", input.len(), output.len())?;
+            if let Some(weight) = weight {
+                validate_vector_length("RMSNorm", "weight", input.len(), weight.len())?;
+            }
+            require_positive("RMSNorm epsilon", epsilon)?;
+            if input.iter().any(|value| !value.is_finite()) {
+                return Err(MetalError::NonFinite {
+                    operation: "RMSNorm",
+                });
+            }
+
+            let count = count_u32(input.len())?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let weight_buffer = self.buffer_with_data(weight.unwrap_or(input))?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            let epsilon_buffer = self.buffer_with_data(&[epsilon])?;
+            let weighted_buffer = self.buffer_with_data(&[u32::from(weight.is_some())])?;
+            self.execute(
+                &self.rms_norm,
+                &[
+                    &input_buffer,
+                    &weight_buffer,
+                    &output_buffer,
+                    &count_buffer,
+                    &epsilon_buffer,
+                    &weighted_buffer,
+                ],
+                REDUCTION_THREADS,
+                REDUCTION_THREADS,
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn rope_neox_in_place(
+            &self,
+            values: &mut [f32],
+            heads: usize,
+            head_dimension: usize,
+            rotated_pairs: usize,
+            position: usize,
+            theta: f32,
+        ) -> Result<(), MetalError> {
+            if heads
+                .checked_mul(head_dimension)
+                .filter(|length| *length == values.len())
+                .is_none()
+            {
+                return Err(MetalError::InvalidRopeShape {
+                    length: values.len(),
+                    heads,
+                    head_dimension,
+                });
+            }
+            if !head_dimension.is_multiple_of(2) || rotated_pairs > head_dimension / 2 {
+                return Err(MetalError::InvalidRopePairs);
+            }
+            require_positive("NeoX RoPE theta", theta)?;
+            if rotated_pairs == 0 || heads == 0 {
+                return Ok(());
+            }
+
+            let pairs = heads
+                .checked_mul(rotated_pairs)
+                .ok_or(MetalError::VectorTooLarge)?;
+            let values_buffer = self.buffer_with_data(values)?;
+            let head_dimension_buffer = self.buffer_with_data(&[count_u32(head_dimension)?])?;
+            let rotated_pairs_buffer = self.buffer_with_data(&[count_u32(rotated_pairs)?])?;
+            let position_buffer = self.buffer_with_data(&[count_u32(position)?])?;
+            let theta_buffer = self.buffer_with_data(&[theta])?;
+            self.execute(
+                &self.rope_neox,
+                &[
+                    &values_buffer,
+                    &head_dimension_buffer,
+                    &rotated_pairs_buffer,
+                    &position_buffer,
+                    &theta_buffer,
+                ],
+                pairs,
+                pairs.min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&values_buffer, values);
+            Ok(())
+        }
+
+        pub fn gelu_mul(
+            &self,
+            gate: &[f32],
+            up: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            require_nonempty("GELU multiply", gate)?;
+            validate_vector_length("GELU multiply", "up", gate.len(), up.len())?;
+            validate_vector_length("GELU multiply", "output", gate.len(), output.len())?;
+            let count = count_u32(gate.len())?;
+            let gate_buffer = self.buffer_with_data(gate)?;
+            let up_buffer = self.buffer_with_data(up)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            self.execute(
+                &self.gelu_mul,
+                &[&gate_buffer, &up_buffer, &output_buffer, &count_buffer],
+                gate.len(),
+                gate.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn softmax(&self, input: &[f32], output: &mut [f32]) -> Result<(), MetalError> {
+            require_nonempty("softmax", input)?;
+            validate_vector_length("softmax", "output", input.len(), output.len())?;
+            if input.iter().any(|value| !value.is_finite()) {
+                return Err(MetalError::NonFinite {
+                    operation: "softmax",
+                });
+            }
+            let count = count_u32(input.len())?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            self.execute(
+                &self.stable_softmax,
+                &[&input_buffer, &output_buffer, &count_buffer],
+                REDUCTION_THREADS,
+                REDUCTION_THREADS,
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn softcap(
+            &self,
+            input: &[f32],
+            cap: f32,
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            require_nonempty("logit softcap", input)?;
+            validate_vector_length("logit softcap", "output", input.len(), output.len())?;
+            require_positive("logit softcap", cap)?;
+            let count = count_u32(input.len())?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            let cap_buffer = self.buffer_with_data(&[cap])?;
+            self.execute(
+                &self.logit_softcap,
+                &[&input_buffer, &output_buffer, &count_buffer, &cap_buffer],
+                input.len(),
+                input.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        pub fn argmax(&self, input: &[f32]) -> Result<usize, MetalError> {
+            require_nonempty("argmax", input)?;
+            if input.iter().any(|value| !value.is_finite()) {
+                return Err(MetalError::NonFinite {
+                    operation: "argmax",
+                });
+            }
+            let count = count_u32(input.len())?;
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<u32>(1)?;
+            let count_buffer = self.buffer_with_data(&[count])?;
+            self.execute(
+                &self.deterministic_argmax,
+                &[&input_buffer, &output_buffer, &count_buffer],
+                REDUCTION_THREADS,
+                REDUCTION_THREADS,
+            )?;
+            let mut output = [0_u32];
+            copy_buffer(&output_buffer, &mut output);
+            Ok(output[0] as usize)
+        }
+
+        fn execute(
+            &self,
+            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+            buffers: &[&ProtocolObject<dyn MTLBuffer>],
+            grid_width: usize,
+            threadgroup_width: usize,
+        ) -> Result<(), MetalError> {
             let command_buffer = self
                 .queue
                 .commandBuffer()
@@ -124,23 +382,20 @@ mod implementation {
             let encoder = command_buffer
                 .computeCommandEncoder()
                 .ok_or(MetalError::CommandEncoding)?;
-            encoder.setComputePipelineState(&self.vector_add);
-            // SAFETY: all buffers remain retained until the command completes,
-            // offsets are zero, and their element layouts match the MSL kernel.
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(&left_buffer), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(&right_buffer), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(&output_buffer), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(&count_buffer), 0, 3);
+            encoder.setComputePipelineState(pipeline);
+            for (index, buffer) in buffers.iter().enumerate() {
+                // SAFETY: callers retain every buffer until this synchronous
+                // execution completes, and every binding uses a zero offset.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index) };
             }
             encoder.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
-                    width: left.len(),
+                    width: grid_width,
                     height: 1,
                     depth: 1,
                 },
                 MTLSize {
-                    width: left.len().min(256),
+                    width: threadgroup_width,
                     height: 1,
                     depth: 1,
                 },
@@ -153,14 +408,6 @@ mod implementation {
                     || "unknown command-buffer error".to_owned(),
                     |error| error.to_string(),
                 )));
-            }
-            // SAFETY: the command has completed, the shared buffer contains at
-            // least output.len() f32 values, and the destination is disjoint.
-            unsafe {
-                output.copy_from_slice(slice::from_raw_parts(
-                    output_buffer.contents().as_ptr().cast::<f32>(),
-                    output.len(),
-                ));
             }
             Ok(())
         }
@@ -188,12 +435,12 @@ mod implementation {
             }
         }
 
-        fn empty_buffer(
+        fn empty_buffer<T>(
             &self,
             elements: usize,
         ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MetalError> {
             let bytes = elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<T>())
                 .ok_or(MetalError::BufferAllocation { bytes: usize::MAX })?;
             let page_size = host_page_size()?;
             let allocated_bytes = bytes
@@ -237,6 +484,52 @@ mod implementation {
         }
     }
 
+    fn copy_buffer<T: Copy>(buffer: &ProtocolObject<dyn MTLBuffer>, output: &mut [T]) {
+        // SAFETY: all callers wait for command completion, allocate at least
+        // output.len() values of T, and copy into a disjoint Rust slice.
+        unsafe {
+            output.copy_from_slice(slice::from_raw_parts(
+                buffer.contents().as_ptr().cast::<T>(),
+                output.len(),
+            ));
+        }
+    }
+
+    fn count_u32(value: usize) -> Result<u32, MetalError> {
+        u32::try_from(value).map_err(|_| MetalError::VectorTooLarge)
+    }
+
+    fn require_nonempty(operation: &'static str, values: &[f32]) -> Result<(), MetalError> {
+        if values.is_empty() {
+            return Err(MetalError::EmptyInput { operation });
+        }
+        Ok(())
+    }
+
+    fn require_positive(operation: &'static str, value: f32) -> Result<(), MetalError> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(MetalError::InvalidPositiveParameter { operation });
+        }
+        Ok(())
+    }
+
+    fn validate_vector_length(
+        operation: &'static str,
+        argument: &'static str,
+        expected: usize,
+        actual: usize,
+    ) -> Result<(), MetalError> {
+        if expected != actual {
+            return Err(MetalError::InvalidVectorLength {
+                operation,
+                argument,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
     fn host_page_size() -> Result<usize, MetalError> {
         // SAFETY: sysconf is thread-safe and has no pointer arguments.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -266,13 +559,25 @@ mod implementation {
     mod tests {
         use objc2_metal::MTLBuffer;
 
+        use crate::cpu;
+
         use super::MetalContext;
+
+        fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+            assert_eq!(actual.len(), expected.len());
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "index {index}: Metal {actual} differs from CPU {expected} by more than {tolerance}"
+                );
+            }
+        }
 
         #[test]
         fn creates_device_and_adds_shared_vectors() {
             let context = MetalContext::new().unwrap();
             assert!(context.device_name().contains("Apple"));
-            let page_buffer = context.empty_buffer(1_024).unwrap();
+            let page_buffer = context.empty_buffer::<f32>(1_024).unwrap();
             assert_eq!(
                 page_buffer.contents().as_ptr() as usize % super::host_page_size().unwrap(),
                 0
@@ -286,6 +591,63 @@ mod implementation {
                 )
                 .unwrap();
             assert_eq!(output, [6.0, 0.0, -2.0, 5.0, 1.0]);
+        }
+
+        #[test]
+        fn gemma_primitives_match_the_cpu_reference() {
+            let context = MetalContext::new().unwrap();
+            let input: Vec<_> = (0..513)
+                .map(|index| ((index % 31) as f32 - 15.0) * 0.071)
+                .collect();
+            let weight: Vec<_> = (0..input.len())
+                .map(|index| 0.8 + (index % 13) as f32 * 0.025)
+                .collect();
+
+            let mut expected = vec![0.0; input.len()];
+            cpu::rms_norm(&input, Some(&weight), 1.0e-6, &mut expected).unwrap();
+            let mut actual = vec![0.0; input.len()];
+            context
+                .rms_norm(&input, Some(&weight), 1.0e-6, &mut actual)
+                .unwrap();
+            assert_close(&actual, &expected, 2.0e-6);
+
+            let mut expected_rope: Vec<_> =
+                (0..48).map(|index| (index as f32 - 24.0) * 0.125).collect();
+            let mut actual_rope = expected_rope.clone();
+            cpu::rope_neox_in_place(&mut expected_rope, 3, 16, 6, 37, 10_000.0).unwrap();
+            context
+                .rope_neox_in_place(&mut actual_rope, 3, 16, 6, 37, 10_000.0)
+                .unwrap();
+            assert_close(&actual_rope, &expected_rope, 2.0e-5);
+
+            let gate: Vec<_> = input.iter().copied().take(67).collect();
+            let up: Vec<_> = gate.iter().map(|value| 1.25 - value * 0.2).collect();
+            let expected_gelu: Vec<_> = gate
+                .iter()
+                .zip(&up)
+                .map(|(gate, up)| cpu::gelu_tanh(*gate) * up)
+                .collect();
+            let mut actual_gelu = vec![0.0; gate.len()];
+            context.gelu_mul(&gate, &up, &mut actual_gelu).unwrap();
+            assert_close(&actual_gelu, &expected_gelu, 2.0e-6);
+
+            let mut expected_softmax = input.clone();
+            cpu::softmax_in_place(&mut expected_softmax).unwrap();
+            let mut actual_softmax = vec![0.0; input.len()];
+            context.softmax(&input, &mut actual_softmax).unwrap();
+            assert_close(&actual_softmax, &expected_softmax, 2.0e-7);
+
+            let mut expected_softcap = input.clone();
+            cpu::softcap_in_place(&mut expected_softcap, 30.0).unwrap();
+            let mut actual_softcap = vec![0.0; input.len()];
+            context.softcap(&input, 30.0, &mut actual_softcap).unwrap();
+            assert_close(&actual_softcap, &expected_softcap, 2.0e-6);
+
+            let logits = [-2.0, 7.5, 4.0, 7.5, 0.0, 7.49];
+            assert_eq!(
+                context.argmax(&logits).unwrap(),
+                cpu::argmax(&logits).unwrap()
+            );
         }
     }
 }
