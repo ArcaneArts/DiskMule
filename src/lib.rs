@@ -9,6 +9,7 @@ pub mod gemma4;
 pub mod gguf;
 pub mod metal;
 pub mod model;
+pub mod runtime;
 pub mod server;
 
 use std::io::{self, BufRead, Write};

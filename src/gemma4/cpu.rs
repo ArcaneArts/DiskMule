@@ -58,6 +58,9 @@ pub enum RuntimeError {
     #[error("generation was cancelled")]
     Cancelled,
 
+    #[error("invalid runtime configuration: {0}")]
+    InvalidConfiguration(String),
+
     #[error("unsupported proportional-RoPE frequency-factor layout")]
     UnsupportedRopeFactors,
 
@@ -188,10 +191,31 @@ impl Gemma4CpuModel {
         prompt_tokens: &[u32],
         maximum_new_tokens: usize,
         cancellation: &CancellationFlag,
+        on_token: F,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(u32, &str),
+    {
+        self.generate_with_selector(
+            prompt_tokens,
+            maximum_new_tokens,
+            cancellation,
+            |logits| Ok(argmax(logits)? as u32),
+            on_token,
+        )
+    }
+
+    pub fn generate_with_selector<F, S>(
+        &self,
+        prompt_tokens: &[u32],
+        maximum_new_tokens: usize,
+        cancellation: &CancellationFlag,
+        mut select: S,
         mut on_token: F,
     ) -> Result<GenerationResult, RuntimeError>
     where
         F: FnMut(u32, &str),
+        S: FnMut(&[f32]) -> Result<u32, RuntimeError>,
     {
         if prompt_tokens.is_empty() {
             return Err(RuntimeError::EmptyPrompt);
@@ -223,7 +247,13 @@ impl Gemma4CpuModel {
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
-            let next = argmax(&logits)? as u32;
+            let next = select(&logits)?;
+            if next as usize >= logits.len() {
+                return Err(RuntimeError::InvalidToken {
+                    token: next,
+                    vocabulary: logits.len(),
+                });
+            }
             if generation_index == 0 {
                 profile.time_to_first_token = started.elapsed();
             }
