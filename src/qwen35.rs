@@ -1,5 +1,7 @@
 //! Qwen3.5/Qwen3.8 hybrid recurrent-attention architecture contract.
 
+pub mod tokenizer;
+
 use crate::gguf::{GgufFile, MetadataValue, TensorType};
 
 pub const RUNTIME_ARRAY_KEYS: [&str; 3] = [
