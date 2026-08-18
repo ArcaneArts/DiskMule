@@ -26,9 +26,10 @@ The Hugging Face model API reported this inventory on 2026-08-18:
 The official
 [`zai-org/GLM-5.2-FP8`](https://huggingface.co/zai-org/GLM-5.2-FP8)
 repository reported 761,025,363,709 bytes (about 709 GiB), so it cannot fit on
-the current volume. The current volume has 474 GiB free. A selective
-grouped-INT4 download would leave only about 83 GiB; the whole repository would
-leave about 74 GiB and bring the volume to roughly 98% utilization. Do not
+the current volume. The final pre-acquisition check reports 466 GiB free. A
+selective grouped-INT4 download would leave only about 75 GiB; the whole
+repository would leave about 66 GiB and bring the volume to roughly 98%
+utilization. Do not
 start either download without explicit authorization. Prefer a dedicated APFS
 volume with at least 550 GiB free so the checkpoint, partial downloads, logs,
 and healthy filesystem headroom do not compete.

@@ -341,14 +341,14 @@ checkpoint or attempting to decode undefined IDs.
 
 Acquisition audit on 2026-08-18: the official `zai-org/GLM-5.2-FP8` repository
 reports `761,025,363,709` bytes (about 709 GiB), which cannot fit in the current
-474 GiB of free space. The recommended
+466 GiB of free space. The recommended
 `mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp` repository reports
 `429,276,080,522` bytes (about 399.8 GiB). Ordinary decode needs its 141 main
 safetensors shards, `419,296,541,560` bytes (about 390.5 GiB), plus small
 configuration/tokenizer files; the optional MTP shard adds `9,959,321,520`
 bytes (about 9.3 GiB) and is not part of the first validation. Even a selective
-main-model acquisition would leave only about 83 GiB free on the current
-volume, while the whole repository would leave about 74 GiB and take the
+main-model acquisition would leave only about 75 GiB free on the current
+volume, while the whole repository would leave about 66 GiB and take the
 volume to roughly 98% utilization. DiskMule will not make that commitment
 without explicit authorization or a suitably sized external target. The exact
 acquisition and validation sequence is retained in

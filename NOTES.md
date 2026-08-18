@@ -220,11 +220,11 @@ This closes safe implementation work but not Phase 6. There is no full GLM-5.2
 checkpoint in the local model stores. The official FP8 repository is about 709
 GiB. The recommended grouped-INT4 repository is about 399.8 GiB total;
 excluding the unneeded first-pass MTP shard still requires about 390.5 GiB.
-With 474 GiB currently free, using the internal volume would leave only about
-83 GiB and is not a safe implicit action. Full out-of-core correctness,
-cache-budget sweeps, memory-pressure measurements, and reproducible performance
-logs require an explicitly authorized acquisition target and storage
-commitment.
+With 466 GiB free at the final pre-acquisition check, using the internal volume
+would leave only about 75 GiB and is not a safe implicit action. Full
+out-of-core correctness, cache-budget sweeps, memory-pressure measurements, and
+reproducible performance logs require an explicitly authorized acquisition
+target and storage commitment.
 
 ## DiskMule Qwen3.5/Qwen3.8 findings
 
