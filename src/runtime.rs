@@ -391,6 +391,12 @@ impl GenerationEngine {
                 Glm52CpuModel::from_directory_with_context_and_metal(&path, context)?
             }
         };
+        tracing::info!(
+            model = %path.display(),
+            backend = %backend.label(),
+            read_cache = model.read_cache_policy().label(),
+            "loaded GLM architecture"
+        );
         Ok(Self {
             name: name.into(),
             path,

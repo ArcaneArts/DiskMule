@@ -8,6 +8,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+
 #[cfg(not(unix))]
 use std::io::{Seek, SeekFrom};
 
@@ -139,6 +142,29 @@ pub enum SafeTensorError {
 
     #[error("safetensors integer arithmetic overflowed while computing {0}")]
     Overflow(&'static str),
+
+    #[error("could not configure {policy} reads for safetensors shard {path}: {source}")]
+    CachePolicy {
+        path: PathBuf,
+        policy: &'static str,
+        source: io::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadCachePolicy {
+    #[default]
+    Buffered,
+    NoCache,
+}
+
+impl ReadCachePolicy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::NoCache => "F_NOCACHE",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,24 +395,46 @@ impl SafeTensorIndex {
 pub struct SafeTensorSource {
     pub index: SafeTensorIndex,
     files: Vec<Arc<File>>,
+    cache_policy: ReadCachePolicy,
 }
 
 impl SafeTensorSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SafeTensorError> {
+        Self::open_with_cache_policy(path, ReadCachePolicy::Buffered)
+    }
+
+    pub fn open_with_cache_policy(
+        path: impl AsRef<Path>,
+        cache_policy: ReadCachePolicy,
+    ) -> Result<Self, SafeTensorError> {
         let index = SafeTensorIndex::open(path)?;
         let files = index
             .shards
             .iter()
             .map(|shard| {
-                File::open(&shard.path)
-                    .map(Arc::new)
-                    .map_err(|source| SafeTensorError::Read {
+                let file = File::open(&shard.path).map_err(|source| SafeTensorError::Read {
+                    path: shard.path.clone(),
+                    source,
+                })?;
+                configure_cache_policy(&file, &shard.path, cache_policy).map_err(|source| {
+                    SafeTensorError::CachePolicy {
                         path: shard.path.clone(),
+                        policy: cache_policy.label(),
                         source,
-                    })
+                    }
+                })?;
+                Ok(Arc::new(file))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { index, files })
+        Ok(Self {
+            index,
+            files,
+            cache_policy,
+        })
+    }
+
+    pub const fn cache_policy(&self) -> ReadCachePolicy {
+        self.cache_policy
     }
 
     pub fn read_tensor_at(
@@ -426,6 +474,38 @@ impl SafeTensorSource {
 
     pub fn shared_file(&self, shard: usize) -> Option<Arc<File>> {
         self.files.get(shard).map(Arc::clone)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_cache_policy(
+    file: &File,
+    _path: &Path,
+    cache_policy: ReadCachePolicy,
+) -> io::Result<()> {
+    if cache_policy == ReadCachePolicy::NoCache {
+        // SAFETY: fcntl only updates the cache policy on this valid, owned file
+        // descriptor; it does not transfer ownership or retain the pointer.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_cache_policy(
+    _file: &File,
+    _path: &Path,
+    cache_policy: ReadCachePolicy,
+) -> io::Result<()> {
+    if cache_policy == ReadCachePolicy::NoCache {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "F_NOCACHE requires macOS",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -743,7 +823,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{SafeDtype, SafeTensorError, SafeTensorIndex, SafeTensorSource};
+    use super::{ReadCachePolicy, SafeDtype, SafeTensorError, SafeTensorIndex, SafeTensorSource};
 
     fn write_shard(path: &Path, entries: serde_json::Value, payload: &[u8]) {
         let header = serde_json::to_vec(&entries).unwrap();
@@ -768,6 +848,7 @@ mod tests {
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         );
         let source = SafeTensorSource::open(&path).unwrap();
+        assert_eq!(source.cache_policy(), ReadCachePolicy::Buffered);
         assert_eq!(source.index.tensors().len(), 2);
         assert_eq!(source.index.tensor("b").unwrap().dtype, SafeDtype::Bf16);
         assert!(source.index.tensor("b").unwrap().absolute_offset > 8);
@@ -775,6 +856,24 @@ mod tests {
         source.read_tensor_at("b", 2, &mut bytes).unwrap();
         assert_eq!(bytes, [11, 12, 13, 14]);
         assert!(source.read_tensor_at("b", 7, &mut bytes).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nocache_source_preserves_exact_positional_reads() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("model.safetensors");
+        write_shard(
+            &path,
+            json!({"value": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}}),
+            &[4, 3, 2, 1],
+        );
+        let source =
+            SafeTensorSource::open_with_cache_policy(&path, ReadCachePolicy::NoCache).unwrap();
+        assert_eq!(source.cache_policy(), ReadCachePolicy::NoCache);
+        let mut bytes = [0_u8; 4];
+        source.read_tensor_at("value", 0, &mut bytes).unwrap();
+        assert_eq!(bytes, [4, 3, 2, 1]);
     }
 
     #[test]

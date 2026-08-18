@@ -158,6 +158,40 @@ one-slot streaming produced a 380.2 ms TTFT and about 2.80 decode tokens/s,
 with zero resident/streamed logit error. These are warm local measurements, not
 SSD or cross-machine claims.
 
+## DiskMule GLM-5.2 implementation findings
+
+DiskMule now has an independent GLM architecture path over strict sharded
+safetensors metadata. Deterministic fixtures cover the complete ordinary-decode
+graph: native byte-level BPE and chat framing, MLA compressed KV, the GLM
+adjacent-pair-to-contiguous-halves RoPE layout, full and shared DSA, router
+correction bias, normalized top-k routed experts, shared experts, and residual
+ordering. CPU readers support F32, F16, BF16, and 128-by-128 block-scaled
+E4M3FN. The tiny fixture predicts `5, 9, 10, 5`; its final logit zero is
+approximately `-0.12922081`.
+
+On Metal, dense tensors remain in retained no-copy whole-shard mappings.
+Safetensors payload offsets are not assumed to be naturally aligned: F32, F16,
+and BF16 kernels reconstruct little-endian values from bytes, avoiding silent
+misreads observed with typed loads from an unaligned fixture. Routed experts
+remain governed by the explicit per-layer bounded LRU. On a miss, exact encoded
+gate/up/down ranges and any FP8 scales are read in bounded parallel; cached
+matrices and SiLU gating then execute through Metal. Tiny full-graph CPU and
+Metal logits and DSA selections match within `1e-4`.
+
+GLM generation uses the same runtime, sampling, CLI, HTTP workers, sessions,
+prefix reuse, cancellation, and bounded queues as Gemma. Its profile reports
+logical tensor bytes, resident MLA/DSA state, expert cache and I/O metrics, and
+embedding/attention/feed-forward/output timing. Buffered reads remain the
+default. `DISKMULE_GLM_DIRECT=1` applies `F_NOCACHE` to each safetensors shard
+descriptor on macOS for a controlled direct-versus-buffered experiment. No
+performance conclusion has been drawn from the tiny fixture.
+
+This closes safe implementation work but not Phase 6. There is no full GLM-5.2
+checkpoint in the local model stores, and the required source or converted
+container is hundreds of gigabytes. Full out-of-core correctness, cache-budget
+sweeps, memory-pressure measurements, and reproducible performance logs require
+an explicitly authorized model acquisition and storage commitment.
+
 ## Shared runtime and server findings
 
 Metal model objects remain on dedicated owning threads. CLI and HTTP requests

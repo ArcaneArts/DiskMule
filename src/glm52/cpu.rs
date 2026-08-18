@@ -16,7 +16,7 @@ use crate::{
         expert::{Glm52ExpertCache, Glm52ExpertCacheError, Glm52ExpertCacheStats},
         tokenizer::{Glm52Tokenizer, Glm52TokenizerError},
     },
-    safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
+    safetensors::{ReadCachePolicy, SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
 };
 
 #[cfg(target_os = "macos")]
@@ -108,6 +108,9 @@ pub enum Glm52CpuError {
 
     #[error("invalid GLM-5.2 expert-cache configuration: {0}")]
     InvalidExpertCache(String),
+
+    #[error("invalid GLM-5.2 I/O configuration: {0}")]
+    InvalidIoConfiguration(String),
 }
 
 /// A loaded CPU model. Dense tensors remain on disk and are read by range as needed.
@@ -188,7 +191,7 @@ impl Glm52CpuModel {
                 ),
             )));
         }
-        let source = SafeTensorSource::open(directory)?;
+        let source = SafeTensorSource::open_with_cache_policy(directory, glm_read_cache_policy()?)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
         let expert_cache = Glm52ExpertCache::new(source.clone(), &weights, expert_cache_slots()?)?;
         #[cfg(target_os = "macos")]
@@ -221,6 +224,10 @@ impl Glm52CpuModel {
             .lock()
             .map(|cache| cache.stats())
             .map_err(|_| Glm52ExpertCacheError::Poisoned.into())
+    }
+
+    pub const fn read_cache_policy(&self) -> ReadCachePolicy {
+        self.source.cache_policy()
     }
 
     pub fn start_session(&self, maximum_context: usize) -> Glm52CpuSession {
@@ -621,6 +628,19 @@ fn expert_cache_slots() -> Result<usize, Glm52CpuError> {
                 "DISKMULE_GLM_EXPERT_SLOTS must be an integer in 1..=256".to_owned(),
             )
         })
+}
+
+fn glm_read_cache_policy() -> Result<ReadCachePolicy, Glm52CpuError> {
+    let Some(raw) = env::var_os("DISKMULE_GLM_DIRECT") else {
+        return Ok(ReadCachePolicy::Buffered);
+    };
+    match raw.to_str() {
+        Some("0" | "false" | "no") => Ok(ReadCachePolicy::Buffered),
+        Some("1" | "true" | "yes") => Ok(ReadCachePolicy::NoCache),
+        _ => Err(Glm52CpuError::InvalidIoConfiguration(
+            "DISKMULE_GLM_DIRECT must be 0/1, false/true, or no/yes".to_owned(),
+        )),
+    }
 }
 
 impl Glm52CpuSession {

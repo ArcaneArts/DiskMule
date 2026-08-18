@@ -284,6 +284,10 @@ shutdown. CLI and both server modes produced the same configured greedy
 
 ### Phase 6: GLM-5.2 and genuine out-of-core operation
 
+Status: implementation complete for deterministic tiny CPU/Metal fixtures;
+full-model validation and performance sweeps remain blocked on an authorized
+GLM-5.2 checkpoint acquisition.
+
 - Add safetensors indexing and the GLM-5.2 architecture module.
 - Port only the GLM-specific semantics required for correct inference, using
   Colibri as a behavioral reference.
@@ -293,6 +297,21 @@ shutdown. CLI and both server modes produced the same configured greedy
 
 Exit criterion: GLM-5.2 generates correct output without fitting the complete
 expert pool in unified memory, with reproducible performance logs.
+
+Current evidence: strict single-file and sharded safetensors indexing validates
+the configuration and complete tensor contract without loading payloads. The
+architecture module implements tokenizer/chat framing, MLA compressed KV,
+full/shared DSA, adjacent-pair RoPE semantics, dense and MoE SwiGLU, correction
+bias routing, shared experts, residual ordering, stops, prefix reuse, and
+cancellation. CPU supports F32/F16/BF16/block-scaled FP8. On macOS, sharded
+dense tensors execute from retained no-copy Metal mappings and selected routed
+experts execute through Metal after bounded parallel reads into an explicit
+per-layer LRU. CPU/Metal tiny-model logits, DSA choices, and greedy tokens
+match. Profiles expose phase timing, logical tensor bytes, resident generation
+state, expert residency, reads, bytes, cache events, and I/O wait. Buffered
+expert reads are the default and `DISKMULE_GLM_DIRECT=1` enables macOS
+`F_NOCACHE` for controlled comparison. This is necessary fixture evidence, not
+the exit criterion's required full-model evidence.
 
 ### Phase 7: broaden model support
 
@@ -321,9 +340,10 @@ server, CLI, or session code unless it introduces a genuinely new capability.
 
 ## Current milestone
 
-Build Phase 6's explicit safetensors and GLM-5.2 implementation without
-weakening the proven Gemma, server, session, storage-backed expert, or model
-ownership boundaries. These commands already work:
+Complete every Phase 6 task that does not require the unavailable full GLM
+checkpoint, implement Phase 7 against an already installed materially
+different Ollama model, and then request authorization for the large GLM model
+and storage commitment. These commands already work:
 
 ```text
 diskmule ls
@@ -332,9 +352,10 @@ diskmule rm gemma4:26b
 diskmule --serve
 ```
 
-`ls` identifies the Ollama-owned Gemma model, `run` provides cancellable Metal
-chat on supported Apple Silicon with an explicit CPU fallback, `rm` safely
-refuses external deletion, and `--serve` provides bounded streaming and
-non-streaming chat. Phase 6 must first add fixture-backed safetensors and GLM
-semantics. A full GLM-5.2 claim still requires the real out-of-core model and
-explicit authorization for any large download or disk commitment.
+`ls` identifies the Ollama-owned models, `run` provides cancellable Metal chat
+on supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
+external deletion, and `--serve` provides bounded streaming and non-streaming
+chat. GLM fixture-backed safetensors, CPU, Metal, session, profiling, and
+storage-backed expert semantics are implemented. A full Phase 6 claim still
+requires the real out-of-core model and explicit authorization for any large
+download or disk commitment.

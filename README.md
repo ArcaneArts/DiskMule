@@ -5,14 +5,16 @@ Silicon. Its long-term purpose is to run multiple explicitly supported model
 families while keeping very large routed-expert pools on storage. Rust owns the
 host runtime and GPU kernels will be written in Metal Shading Language.
 
-The current implementation includes the model-management boundary plus complete
-deterministic Gemma 4 26B CPU and Metal paths. It can inspect and map GGUF
+The current implementation includes the model-management boundary, complete
+deterministic Gemma 4 26B CPU and Metal paths, and fixture-validated GLM-5.2
+CPU/Metal execution over sharded safetensors. It can inspect and map GGUF
 tensors, discover local Ollama models without copying them, safely manage
 DiskMule-owned entries, run streaming terminal chat, retain bounded Metal KV
-state, and force routed experts through an explicit storage-backed cache. The
+state, and force routed experts through explicit storage-backed caches. The
 CLI and Ollama-compatible HTTP server share bounded model workers, persistent
-KV sessions, deterministic sampling, streaming, and cancellation. GLM-5.2
-format and architecture support is the next active phase.
+KV sessions, deterministic sampling, streaming, and cancellation. A real
+hundreds-of-gigabytes GLM-5.2 checkpoint is still required before claiming
+full-model correctness or out-of-core performance.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
 for the Colibri and TurboFieldfare research behind it.
@@ -42,11 +44,13 @@ status. `metadata-compatible` means the GGUF metadata and tensor ranges passed
 bounded inspection. The architecture runtime performs its stricter complete
 configuration and tensor-shape validation when a prompt first loads the model.
 
-Start an interactive chat with a named model or direct local GGUF path:
+Start an interactive chat with a named model, direct local GGUF path, or local
+GLM-5.2 safetensors snapshot directory:
 
 ```bash
 diskmule run gemma4:26b
 diskmule run /path/to/model.gguf
+diskmule run /path/to/glm-5.2-snapshot
 ```
 
 `run` prints the resolved model details and starts an EOF-safe terminal loop.
@@ -64,7 +68,17 @@ DISKMULE_CONTEXT=4096 DISKMULE_MAX_TOKENS=64 diskmule run gemma4:26b
 DISKMULE_TEMPERATURE=0.8 DISKMULE_TOP_K=40 DISKMULE_TOP_P=0.9 DISKMULE_SEED=42 diskmule run gemma4:26b
 DISKMULE_BACKEND=cpu diskmule run gemma4:26b
 DISKMULE_EXPERT_SLOTS=4 diskmule run gemma4:26b
+DISKMULE_GLM_EXPERT_SLOTS=8 diskmule run /path/to/glm-5.2-snapshot
+DISKMULE_GLM_DIRECT=1 diskmule run /path/to/glm-5.2-snapshot
 ```
+
+GLM dense, attention, router, shared-expert, and output matrices are mapped
+directly into Metal on macOS. Selected routed experts are read on demand into a
+deterministic bounded per-layer LRU; `DISKMULE_GLM_EXPERT_SLOTS` accepts 1–256
+slots per sparse layer and defaults to eight. Expert reads are buffered by
+default. `DISKMULE_GLM_DIRECT=1` applies macOS `F_NOCACHE` to the safetensors
+descriptors so direct and buffered behavior can be compared under identical
+model semantics. This setting is an experiment knob, not an assumed speedup.
 
 Remove a DiskMule-owned model:
 
@@ -173,6 +187,16 @@ parallel shared and routed experts, sandwich residuals, tied output projection,
 softcapping, greedy selection, KV reuse, cancellation checks, and phase timing.
 A syntactically valid file using an unimplemented architecture or tensor type
 is reported as unsupported rather than being presented as runnable.
+
+The safetensors reader validates single-file or indexed sharded snapshots
+without loading tensor payloads. The GLM-5.2 module owns tokenizer/chat framing,
+MLA compressed KV state, full/shared DSA selection history, RoPE, routing,
+shared and streamed experts, residual order, and stop tokens. CPU execution
+supports F32, F16, BF16, and block-scaled FP8; Metal dispatches the same dense
+and cached-expert encodings. Generation profiles include logical tensor bytes,
+resident KV/DSA bytes, cache reads/hits/misses/evictions/I/O wait, and phase
+timings. Tiny deterministic fixtures prove CPU/Metal parity but are not treated
+as full GLM evidence.
 
 On macOS, the Metal backend implements the same encodings and Gemma operations
 with a retained no-copy view of the GGUF mapping. Its KV cache is resident and
