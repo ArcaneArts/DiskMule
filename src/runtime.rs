@@ -15,14 +15,14 @@ use crate::{
     config::Paths,
     gemma4::{
         ChatMessage, Gemma4Tokenizer,
-        cpu::{CancellationFlag, Gemma4CpuModel, GenerationResult, RuntimeError},
+        cpu::{CancellationFlag, Gemma4CpuModel, Gemma4CpuSession, GenerationResult, RuntimeError},
         render_chat,
     },
     model::{ModelCatalog, ModelError},
 };
 
 #[cfg(target_os = "macos")]
-use crate::gemma4::metal::{ExpertResidency, Gemma4MetalModel};
+use crate::gemma4::metal::{ExpertResidency, Gemma4MetalModel, Gemma4MetalSession};
 
 pub const DEFAULT_CONTEXT: usize = 4_096;
 pub const DEFAULT_MAXIMUM_NEW_TOKENS: usize = 64;
@@ -66,6 +66,7 @@ pub struct RuntimeLimits {
     pub maximum_loaded_models: usize,
     pub request_queue: usize,
     pub token_buffer: usize,
+    pub maximum_sessions_per_model: usize,
 }
 
 impl Default for RuntimeLimits {
@@ -75,6 +76,7 @@ impl Default for RuntimeLimits {
             maximum_loaded_models: 1,
             request_queue: 8,
             token_buffer: 32,
+            maximum_sessions_per_model: 2,
         }
     }
 }
@@ -86,6 +88,7 @@ impl RuntimeLimits {
             maximum_loaded_models: bounded_environment("DISKMULE_MAX_MODELS", 1, 1, 16)?,
             request_queue: bounded_environment("DISKMULE_REQUEST_QUEUE", 8, 1, 1_024)?,
             token_buffer: bounded_environment("DISKMULE_TOKEN_BUFFER", 32, 1, 4_096)?,
+            maximum_sessions_per_model: bounded_environment("DISKMULE_MAX_SESSIONS", 2, 1, 16)?,
         }
         .validate()
     }
@@ -109,6 +112,11 @@ impl RuntimeLimits {
         if !(1..=4_096).contains(&self.token_buffer) {
             return Err(ServiceError::InvalidLimits(
                 "token_buffer must be in 1..=4096".to_owned(),
+            ));
+        }
+        if !(1..=16).contains(&self.maximum_sessions_per_model) {
+            return Err(ServiceError::InvalidLimits(
+                "maximum_sessions_per_model must be in 1..=16".to_owned(),
             ));
         }
         Ok(self)
@@ -307,6 +315,17 @@ enum ArchitectureModel {
     Gemma4Metal(Gemma4MetalModel),
 }
 
+enum ArchitectureSession {
+    Gemma4Cpu(Gemma4CpuSession),
+    #[cfg(target_os = "macos")]
+    Gemma4Metal(Gemma4MetalSession),
+}
+
+struct ResidentSession {
+    state: ArchitectureSession,
+    last_used: u64,
+}
+
 impl GenerationEngine {
     pub fn open_gemma4(
         name: impl Into<String>,
@@ -398,6 +417,61 @@ impl GenerationEngine {
             ),
         }
     }
+
+    fn new_session(&self) -> Result<ArchitectureSession, RuntimeError> {
+        match &self.model {
+            ArchitectureModel::Gemma4Cpu(model) => {
+                Ok(ArchitectureSession::Gemma4Cpu(model.new_session()))
+            }
+            #[cfg(target_os = "macos")]
+            ArchitectureModel::Gemma4Metal(model) => {
+                Ok(ArchitectureSession::Gemma4Metal(model.new_session()?))
+            }
+        }
+    }
+
+    fn generate_chat_in_session<F>(
+        &self,
+        session: &mut ArchitectureSession,
+        messages: &[ChatMessage],
+        options: GenerationOptions,
+        cancellation: &CancellationFlag,
+        on_token: F,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(u32, &str),
+    {
+        let options = options.validate()?;
+        let rendered = render_chat(messages)?;
+        let tokens = self.tokenizer().encode(&rendered, false);
+        let mut sampler = Sampler::new(options.sampling)?;
+        match (&self.model, session) {
+            (ArchitectureModel::Gemma4Cpu(model), ArchitectureSession::Gemma4Cpu(session)) => model
+                .generate_session_with_selector(
+                    session,
+                    &tokens,
+                    options.maximum_new_tokens,
+                    cancellation,
+                    |logits| sampler.select(logits),
+                    on_token,
+                ),
+            #[cfg(target_os = "macos")]
+            (ArchitectureModel::Gemma4Metal(model), ArchitectureSession::Gemma4Metal(session)) => {
+                model.generate_session_with_selector(
+                    session,
+                    &tokens,
+                    options.maximum_new_tokens,
+                    cancellation,
+                    |logits| sampler.select(logits),
+                    on_token,
+                )
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(RuntimeError::InvalidConfiguration(
+                "session architecture does not match its loaded model".to_owned(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -419,9 +493,36 @@ struct ModelWorker {
     backend: String,
     sender: mpsc::SyncSender<GenerationJob>,
     status: Arc<Mutex<WorkerStatus>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RuntimeServiceInner {
+    fn drop(&mut self) {
+        let workers = self
+            .workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let drained = workers
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect::<Vec<_>>();
+        let mut threads = Vec::with_capacity(drained.len());
+        for mut worker in drained {
+            drop(worker.sender);
+            if let Some(thread) = worker.thread.take() {
+                threads.push(thread);
+            }
+        }
+        for thread in threads {
+            if thread.join().is_err() {
+                tracing::warn!("a DiskMule model worker panicked during shutdown");
+            }
+        }
+    }
 }
 
 struct GenerationJob {
+    session_id: Option<String>,
     messages: Vec<ChatMessage>,
     options: GenerationOptions,
     cancellation: CancellationFlag,
@@ -525,6 +626,38 @@ impl RuntimeService {
         messages: Vec<ChatMessage>,
         options: GenerationOptions,
     ) -> Result<GenerationTicket, ServiceError> {
+        self.generate_with_session(model, None, messages, options)
+    }
+
+    pub fn generate_in_session(
+        &self,
+        model: &str,
+        session_id: impl Into<String>,
+        messages: Vec<ChatMessage>,
+        options: GenerationOptions,
+    ) -> Result<GenerationTicket, ServiceError> {
+        let session_id = session_id.into();
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || !session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+        {
+            return Err(ServiceError::InvalidRequest(
+                "session ID must use 1..=128 ASCII letters, numbers, '-', '_', '.', or ':'"
+                    .to_owned(),
+            ));
+        }
+        self.generate_with_session(model, Some(session_id), messages, options)
+    }
+
+    fn generate_with_session(
+        &self,
+        model: &str,
+        session_id: Option<String>,
+        messages: Vec<ChatMessage>,
+        options: GenerationOptions,
+    ) -> Result<GenerationTicket, ServiceError> {
         options
             .validate()
             .map_err(|error| ServiceError::InvalidRequest(error.to_string()))?;
@@ -597,6 +730,7 @@ impl RuntimeService {
         let cancellation = CancellationFlag::default();
         let (events, receiver) = async_mpsc::channel(self.inner.limits.token_buffer);
         let job = GenerationJob {
+            session_id,
             messages,
             options,
             cancellation: cancellation.clone(),
@@ -628,14 +762,19 @@ fn spawn_model_worker(
     let status = Arc::new(Mutex::new(WorkerStatus::Loading));
     let worker_status = Arc::clone(&status);
     let worker_name = name.clone();
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("diskmule-model".to_owned())
         .spawn(move || {
             let engine = GenerationEngine::open_gemma4(worker_name, path, limits.context, backend);
             match engine {
                 Ok(engine) => {
                     *lock_unpoisoned(&worker_status) = WorkerStatus::Ready;
-                    run_model_worker(&engine, receiver, &worker_status);
+                    run_model_worker(
+                        &engine,
+                        receiver,
+                        &worker_status,
+                        limits.maximum_sessions_per_model,
+                    );
                 }
                 Err(error) => {
                     *lock_unpoisoned(&worker_status) = WorkerStatus::Failed;
@@ -660,6 +799,7 @@ fn spawn_model_worker(
         backend: backend.label(),
         sender,
         status,
+        thread: Some(thread),
     })
 }
 
@@ -667,7 +807,10 @@ fn run_model_worker(
     engine: &GenerationEngine,
     receiver: mpsc::Receiver<GenerationJob>,
     status: &Mutex<WorkerStatus>,
+    maximum_sessions: usize,
 ) {
+    let mut sessions = HashMap::<String, ResidentSession>::new();
+    let mut session_clock = 0_u64;
     for job in receiver {
         *lock_unpoisoned(status) = WorkerStatus::Busy;
         if job.cancellation.is_cancelled() {
@@ -680,18 +823,61 @@ fn run_model_worker(
         }
         let events = job.events.clone();
         let cancellation = job.cancellation.clone();
-        let result =
-            engine.generate_chat(&job.messages, job.options, &job.cancellation, |id, text| {
-                if events
-                    .blocking_send(GenerationEvent::Token {
-                        id,
-                        text: text.to_owned(),
-                    })
-                    .is_err()
-                {
-                    cancellation.cancel();
+        let mut on_token = |id, text: &str| {
+            if events
+                .blocking_send(GenerationEvent::Token {
+                    id,
+                    text: text.to_owned(),
+                })
+                .is_err()
+            {
+                cancellation.cancel();
+            }
+        };
+        let result = if let Some(session_id) = &job.session_id {
+            session_clock = session_clock.wrapping_add(1);
+            if !sessions.contains_key(session_id) {
+                if sessions.len() >= maximum_sessions {
+                    let oldest = sessions
+                        .iter()
+                        .min_by(|left, right| {
+                            left.1
+                                .last_used
+                                .cmp(&right.1.last_used)
+                                .then_with(|| left.0.cmp(right.0))
+                        })
+                        .map(|(id, _)| id.clone())
+                        .expect("positive session limit with a full map has an oldest entry");
+                    sessions.remove(&oldest);
                 }
-            });
+                engine.new_session().map(|state| {
+                    sessions.insert(
+                        session_id.clone(),
+                        ResidentSession {
+                            state,
+                            last_used: session_clock,
+                        },
+                    );
+                })
+            } else {
+                Ok(())
+            }
+            .and_then(|()| {
+                let session = sessions
+                    .get_mut(session_id)
+                    .expect("session exists after successful creation");
+                session.last_used = session_clock;
+                engine.generate_chat_in_session(
+                    &mut session.state,
+                    &job.messages,
+                    job.options,
+                    &job.cancellation,
+                    &mut on_token,
+                )
+            })
+        } else {
+            engine.generate_chat(&job.messages, job.options, &job.cancellation, &mut on_token)
+        };
         match result {
             Ok(result) => {
                 let _ = job

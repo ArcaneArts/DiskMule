@@ -10,7 +10,10 @@ use crate::{
     metal::{MetalContext, MetalKvLayer, MetalMappedBuffer, MetalOwnedBuffer},
 };
 
-use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError};
+use super::cpu::{
+    CancellationFlag, GenerationProfile, GenerationResult, RuntimeError, common_prefix_length,
+    validate_generation_request,
+};
 
 #[derive(Debug)]
 pub struct MetalKvCache {
@@ -83,6 +86,14 @@ pub struct Gemma4MetalModel {
     expert_residency: ExpertResidency,
     max_context: usize,
     full_rope_pairs: usize,
+}
+
+#[derive(Debug)]
+pub struct Gemma4MetalSession {
+    cache: MetalKvCache,
+    expert_cache: Option<ExpertCache>,
+    tokens: Vec<u32>,
+    logits: Option<Vec<f32>>,
 }
 
 impl Gemma4MetalModel {
@@ -192,6 +203,163 @@ impl Gemma4MetalModel {
             &layouts,
             slots_per_layer,
         )?))
+    }
+
+    pub fn new_session(&self) -> Result<Gemma4MetalSession, RuntimeError> {
+        Ok(Gemma4MetalSession {
+            cache: self.new_cache()?,
+            expert_cache: self.new_expert_cache()?,
+            tokens: Vec::new(),
+            logits: None,
+        })
+    }
+
+    pub fn generate_session_with_selector<F, S>(
+        &self,
+        session: &mut Gemma4MetalSession,
+        prompt_tokens: &[u32],
+        maximum_new_tokens: usize,
+        cancellation: &CancellationFlag,
+        mut select: S,
+        mut on_token: F,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(u32, &str),
+        S: FnMut(&[f32]) -> Result<u32, RuntimeError>,
+    {
+        validate_generation_request(prompt_tokens, maximum_new_tokens, self.max_context)?;
+        let reusable = common_prefix_length(&session.tokens, prompt_tokens);
+        let stable_logits = (reusable == session.tokens.len())
+            .then(|| session.logits.clone())
+            .flatten();
+        session.cache.truncate(reusable);
+        session.tokens.truncate(reusable);
+        session.logits = stable_logits.clone();
+
+        let result = self.generate_metal_session_inner(
+            session,
+            prompt_tokens,
+            maximum_new_tokens,
+            cancellation,
+            &mut select,
+            &mut on_token,
+        );
+        if result.is_err() {
+            session.cache.truncate(reusable);
+            session.tokens.truncate(reusable);
+            session.logits = stable_logits;
+        }
+        result
+    }
+
+    fn generate_metal_session_inner<F, S>(
+        &self,
+        session: &mut Gemma4MetalSession,
+        prompt_tokens: &[u32],
+        maximum_new_tokens: usize,
+        cancellation: &CancellationFlag,
+        select: &mut S,
+        on_token: &mut F,
+    ) -> Result<GenerationResult, RuntimeError>
+    where
+        F: FnMut(u32, &str),
+        S: FnMut(&[f32]) -> Result<u32, RuntimeError>,
+    {
+        let started = Instant::now();
+        let mut profile = GenerationProfile {
+            prompt_tokens: prompt_tokens.len(),
+            reused_prompt_tokens: session.tokens.len(),
+            resident_kv_bytes: u64::try_from(session.cache.allocated_bytes()).unwrap_or(u64::MAX),
+            ..GenerationProfile::default()
+        };
+        let prefill_started = Instant::now();
+        let mut logits = if session.tokens.len() == prompt_tokens.len() {
+            session.logits.clone().ok_or_else(|| {
+                RuntimeError::InvalidConfiguration(
+                    "session is missing logits for its cached token prefix".to_owned(),
+                )
+            })?
+        } else {
+            let mut final_logits = None;
+            for (position, token) in prompt_tokens
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(session.tokens.len())
+            {
+                cancellation.check()?;
+                let output = self.forward_token(
+                    token,
+                    position,
+                    &mut session.cache,
+                    &mut session.expert_cache,
+                    position + 1 == prompt_tokens.len(),
+                    cancellation,
+                    &mut profile,
+                )?;
+                session.tokens.push(token);
+                if let Some(output) = output {
+                    session.logits = Some(output.clone());
+                    final_logits = Some(output);
+                } else {
+                    session.logits = None;
+                }
+            }
+            final_logits.expect("non-empty uncached prompt suffix produces logits")
+        };
+        profile.prefill_time = prefill_started.elapsed();
+
+        let mut generated = Vec::with_capacity(maximum_new_tokens);
+        let mut stopped = false;
+        for generation_index in 0..maximum_new_tokens {
+            cancellation.check()?;
+            let next = select(&logits)?;
+            if next as usize >= logits.len() {
+                return Err(RuntimeError::InvalidToken {
+                    token: next,
+                    vocabulary: logits.len(),
+                });
+            }
+            if generation_index == 0 {
+                profile.time_to_first_token = started.elapsed();
+            }
+            if self.tokenizer.stop_token_ids.contains(&next) {
+                stopped = true;
+                break;
+            }
+            let piece = self.tokenizer.decode(&[next], true);
+            on_token(next, &piece);
+            generated.push(next);
+            profile.generated_tokens += 1;
+            if generation_index + 1 < maximum_new_tokens {
+                let decode_started = Instant::now();
+                logits = self
+                    .forward_token(
+                        next,
+                        prompt_tokens.len() + generation_index,
+                        &mut session.cache,
+                        &mut session.expert_cache,
+                        true,
+                        cancellation,
+                        &mut profile,
+                    )?
+                    .expect("decode requests logits");
+                session.tokens.push(next);
+                session.logits = Some(logits.clone());
+                profile.decode_time += decode_started.elapsed();
+            }
+        }
+        record_expert_stats(
+            &mut profile,
+            session.expert_cache.as_ref().map(ExpertCache::stats),
+        );
+        profile.total_time = started.elapsed();
+        Ok(GenerationResult {
+            text: self.tokenizer.decode(&generated, true),
+            token_ids: generated,
+            stopped,
+            profile,
+        })
     }
 
     pub fn generate_greedy<F>(

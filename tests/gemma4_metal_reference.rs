@@ -99,6 +99,36 @@ fn greedy_metal_decode_matches_the_cpu_and_ollama_oracles() {
     assert_eq!(result.profile.prompt_tokens, 1);
     assert_eq!(result.profile.generated_tokens, 4);
 
+    let mut session = model.new_session().unwrap();
+    let first_turn = model
+        .generate_session_with_selector(
+            &mut session,
+            &[model.tokenizer.bos_id],
+            2,
+            &CancellationFlag::default(),
+            |logits| Ok(argmax(logits).unwrap() as u32),
+            |_, _| {},
+        )
+        .unwrap();
+    let second_prompt = [
+        model.tokenizer.bos_id,
+        first_turn.token_ids[0],
+        first_turn.token_ids[1],
+    ];
+    let second_turn = model
+        .generate_session_with_selector(
+            &mut session,
+            &second_prompt,
+            2,
+            &CancellationFlag::default(),
+            |logits| Ok(argmax(logits).unwrap() as u32),
+            |_, _| {},
+        )
+        .unwrap();
+    assert_eq!(first_turn.token_ids, result.token_ids[..2]);
+    assert_eq!(second_turn.token_ids, result.token_ids[2..]);
+    assert_eq!(second_turn.profile.reused_prompt_tokens, 2);
+
     let streamed = Gemma4MetalModel::open_with_expert_residency(
         &blob,
         8,

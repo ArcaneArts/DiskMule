@@ -61,6 +61,8 @@ struct OllamaChatRequest {
     stream: bool,
     #[serde(default)]
     options: OllamaOptions,
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +105,7 @@ struct ResponseMetrics {
     total_duration: u64,
     load_duration: u64,
     prompt_eval_count: usize,
+    prompt_cached_count: usize,
     prompt_eval_duration: u64,
     eval_count: usize,
     eval_duration: u64,
@@ -182,7 +185,11 @@ async fn chat(
         Ok(prepared) => prepared,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
     };
-    let ticket = match runtime.generate(&request.model, messages, options) {
+    let ticket = match &request.session {
+        Some(session) => runtime.generate_in_session(&request.model, session, messages, options),
+        None => runtime.generate(&request.model, messages, options),
+    };
+    let ticket = match ticket {
         Ok(ticket) => ticket,
         Err(error) => return service_error_response(error),
     };
@@ -325,7 +332,10 @@ fn metrics(profile: &GenerationProfile) -> ResponseMetrics {
     ResponseMetrics {
         total_duration: duration_nanos(profile.total_time),
         load_duration: 0,
-        prompt_eval_count: profile.prompt_tokens,
+        prompt_eval_count: profile
+            .prompt_tokens
+            .saturating_sub(profile.reused_prompt_tokens),
+        prompt_cached_count: profile.reused_prompt_tokens,
         prompt_eval_duration: duration_nanos(profile.prefill_time),
         eval_count: profile.generated_tokens,
         eval_duration: duration_nanos(profile.decode_time),
@@ -486,6 +496,15 @@ mod tests {
         .await;
         assert!(missing.starts_with("HTTP/1.1 404 Not Found"));
         assert!(missing.contains(r#"model \"absent\" was not found"#));
+
+        let invalid_session = request(
+            address,
+            "POST /api/chat",
+            r#"{"model":"absent","session":"../escape","messages":[{"role":"user","content":"hello"}]}"#,
+        )
+        .await;
+        assert!(invalid_session.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(invalid_session.contains("session ID must use"));
 
         shutdown_tx.send(()).unwrap();
         timeout(Duration::from_secs(2), task)

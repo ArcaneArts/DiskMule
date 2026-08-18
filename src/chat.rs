@@ -72,7 +72,7 @@ pub async fn run_model(
             loading_announced = true;
         }
         history.push(ChatMessage::new(ChatRole::User, prompt));
-        let mut ticket = runtime.generate(model, history.clone(), options)?;
+        let mut ticket = runtime.generate_in_session(model, "cli", history.clone(), options)?;
         let interrupt = tokio::signal::ctrl_c();
         tokio::pin!(interrupt);
         let mut completed_text = None;
