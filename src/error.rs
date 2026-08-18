@@ -22,6 +22,9 @@ pub enum AppError {
 
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    #[error(transparent)]
+    Gguf(#[from] crate::gguf::GgufError),
 }
 
 impl AppError {
@@ -33,6 +36,7 @@ impl AppError {
             Self::NotImplemented(_) | Self::NotImplementedWithContext { .. } | Self::Io(_) => {
                 ExitCode::FAILURE
             }
+            Self::Gguf(_) => ExitCode::FAILURE,
         }
     }
 }
