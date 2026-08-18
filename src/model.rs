@@ -8,7 +8,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Paths, gguf::GgufFile};
+use crate::{
+    config::Paths,
+    gguf::GgufFile,
+    glm52::{Glm52Config, Glm52Weights},
+    safetensors::{SafeDtype, SafeTensorIndex},
+};
 
 const REGISTRY_VERSION: u32 = 1;
 const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
@@ -113,6 +118,7 @@ pub struct ModelRecord {
     pub source: ModelSource,
     pub compatibility: Compatibility,
     pub gguf: Option<GgufSummary>,
+    pub safetensors: Option<SafeTensorsSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +126,12 @@ pub struct GgufSummary {
     pub version: u32,
     pub alignment: u32,
     pub data_offset: u64,
+    pub tensor_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeTensorsSummary {
+    pub shard_count: usize,
     pub tensor_count: usize,
 }
 
@@ -229,7 +241,7 @@ impl ModelCatalog {
             Ok(record) => Ok(record.clone()),
             Err(ModelError::NotFound(_)) => {
                 let path = PathBuf::from(input);
-                if !path.is_file() {
+                if !path.is_file() && !path.is_dir() {
                     return Err(ModelError::NotFound(input.to_owned()));
                 }
                 let canonical = fs::canonicalize(&path).map_err(|source| ModelError::Read {
@@ -389,6 +401,7 @@ fn inspect_managed_entry(root: &Path, entry: &ManagedEntry) -> ModelRecord {
             source: ModelSource::DiskMule,
             compatibility: Compatibility::Invalid(error.to_string()),
             gguf: None,
+            safetensors: None,
         },
     }
 }
@@ -490,6 +503,7 @@ fn inspect_ollama_manifest(root: &Path, name: String, manifest_path: &Path) -> M
             source: ModelSource::Ollama,
             compatibility: Compatibility::Invalid(error.to_string()),
             gguf: None,
+            safetensors: None,
         },
     }
 }
@@ -500,6 +514,9 @@ fn inspect_model(
     source: ModelSource,
     declared_size: Option<u64>,
 ) -> ModelRecord {
+    if path.is_dir() {
+        return inspect_safetensors_model(name, path, source);
+    }
     let actual_size = fs::metadata(&path).ok().map(|metadata| metadata.len());
     match GgufFile::inspect(&path) {
         Ok(gguf) => {
@@ -526,6 +543,7 @@ fn inspect_model(
                     data_offset: gguf.data_offset,
                     tensor_count: gguf.tensors.len(),
                 }),
+                safetensors: None,
             }
         }
         Err(error) => ModelRecord {
@@ -537,6 +555,75 @@ fn inspect_model(
             source,
             compatibility: Compatibility::Invalid(error.to_string()),
             gguf: None,
+            safetensors: None,
+        },
+    }
+}
+
+fn inspect_safetensors_model(name: String, path: PathBuf, source: ModelSource) -> ModelRecord {
+    let result = (|| {
+        let config = Glm52Config::from_directory(&path).map_err(|error| error.to_string())?;
+        let index = SafeTensorIndex::open(&path).map_err(|error| error.to_string())?;
+        Glm52Weights::from_index(&index, &config).map_err(|error| error.to_string())?;
+        if !path.join("tokenizer.json").is_file() {
+            return Err("missing tokenizer.json".to_owned());
+        }
+        let size = index
+            .shards()
+            .iter()
+            .try_fold(0_u64, |total, shard| total.checked_add(shard.file_len));
+        let quantization = if index
+            .tensors()
+            .iter()
+            .any(|tensor| tensor.dtype == SafeDtype::F8E4M3)
+        {
+            "F8_E4M3/F32"
+        } else if index
+            .tensors()
+            .iter()
+            .any(|tensor| tensor.dtype == SafeDtype::Bf16)
+        {
+            "BF16/F32"
+        } else if index
+            .tensors()
+            .iter()
+            .any(|tensor| tensor.dtype == SafeDtype::F16)
+        {
+            "F16/F32"
+        } else {
+            "F32"
+        };
+        Ok((
+            size,
+            quantization.to_owned(),
+            SafeTensorsSummary {
+                shard_count: index.shards().len(),
+                tensor_count: index.tensors().len(),
+            },
+        ))
+    })();
+    match result {
+        Ok((size, quantization, summary)) => ModelRecord {
+            name,
+            path: Some(path),
+            architecture: Some("glm_moe_dsa".to_owned()),
+            quantization: Some(quantization),
+            size,
+            source,
+            compatibility: Compatibility::MetadataCompatible,
+            gguf: None,
+            safetensors: Some(summary),
+        },
+        Err(error) => ModelRecord {
+            name,
+            path: Some(path),
+            architecture: None,
+            quantization: None,
+            size: None,
+            source,
+            compatibility: Compatibility::Invalid(error),
+            gguf: None,
+            safetensors: None,
         },
     }
 }

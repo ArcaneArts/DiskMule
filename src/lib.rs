@@ -82,6 +82,10 @@ pub async fn execute_with_io(
                 writeln!(output, "Alignment: {} bytes", summary.alignment)?;
                 writeln!(output, "Tensor data offset: {}", summary.data_offset)?;
             }
+            if let Some(summary) = &record.safetensors {
+                writeln!(output, "SafeTensors shards: {}", summary.shard_count)?;
+                writeln!(output, "Tensors: {}", summary.tensor_count)?;
+            }
             writeln!(output, "Status: {}", record.compatibility)?;
             if !record.compatibility.is_metadata_compatible() {
                 return Err(model::ModelError::NotRunnable {
