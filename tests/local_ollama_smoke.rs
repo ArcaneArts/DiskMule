@@ -65,6 +65,12 @@ fn installed_gemma_is_listed_inspected_and_protected() {
     assert_eq!(weights.output, weights.token_embedding);
     assert_eq!(
         weights
+            .tensor(&source.gguf, weights.rope_frequencies)
+            .dimensions,
+        [256]
+    );
+    assert_eq!(
+        weights
             .layers
             .iter()
             .filter(|layer| layer.attention_value.is_none())

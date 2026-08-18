@@ -1,5 +1,7 @@
 //! Gemma 4 architecture metadata, tokenizer, and chat framing.
 
+pub mod cpu;
+
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::gguf::{GgufFile, MetadataArray, MetadataValue, TensorInfo};
@@ -79,6 +81,7 @@ pub struct Gemma4Config {
     pub key_length_swa: u32,
     pub value_length: u32,
     pub value_length_swa: u32,
+    pub shared_kv_layers: u32,
     pub rms_epsilon: f32,
     pub sliding_window: u32,
     pub sliding_layers: Vec<bool>,
@@ -91,6 +94,7 @@ pub struct Gemma4Config {
     pub rope_dimensions_swa: u32,
     pub rope_frequency_base: f32,
     pub rope_frequency_base_swa: f32,
+    pub per_layer_embedding_length: u32,
 }
 
 impl Gemma4Config {
@@ -116,6 +120,7 @@ impl Gemma4Config {
             key_length_swa: required_u32(gguf, "gemma4.attention.key_length_swa")?,
             value_length: required_u32(gguf, "gemma4.attention.value_length")?,
             value_length_swa: required_u32(gguf, "gemma4.attention.value_length_swa")?,
+            shared_kv_layers: required_u32(gguf, "gemma4.attention.shared_kv_layers")?,
             rms_epsilon: required_f32(gguf, "gemma4.attention.layer_norm_rms_epsilon")?,
             sliding_window: required_u32(gguf, "gemma4.attention.sliding_window")?,
             sliding_layers: required_bool_array(gguf, "gemma4.attention.sliding_window_pattern")?
@@ -129,6 +134,10 @@ impl Gemma4Config {
             rope_dimensions_swa: required_u32(gguf, "gemma4.rope.dimension_count_swa")?,
             rope_frequency_base: required_f32(gguf, "gemma4.rope.freq_base")?,
             rope_frequency_base_swa: required_f32(gguf, "gemma4.rope.freq_base_swa")?,
+            per_layer_embedding_length: required_u32(
+                gguf,
+                "gemma4.embedding_length_per_layer_input",
+            )?,
         };
         config.validate_26b()?;
         Ok(config)
@@ -146,6 +155,16 @@ impl Gemma4Config {
             "gemma4.attention.value_length_swa",
             self.value_length_swa,
             256,
+        )?;
+        expect_field(
+            "gemma4.attention.shared_kv_layers",
+            self.shared_kv_layers,
+            0,
+        )?;
+        expect_field(
+            "gemma4.embedding_length_per_layer_input",
+            self.per_layer_embedding_length,
+            0,
         )?;
         expect_field(
             "gemma4.attention.sliding_window",
@@ -223,6 +242,7 @@ pub struct Gemma4Weights {
     pub token_embedding: usize,
     pub output_norm: usize,
     pub output: usize,
+    pub rope_frequencies: usize,
     pub tied_output: bool,
     pub layers: Vec<Gemma4LayerWeights>,
 }
@@ -241,6 +261,7 @@ pub struct Gemma4LayerWeights {
     pub feed_forward_gate: usize,
     pub feed_forward_up: usize,
     pub feed_forward_down: usize,
+    pub shared_post_norm: usize,
     pub post_feed_forward_norm: usize,
     pub routed_pre_norm: usize,
     pub routed_post_norm: usize,
@@ -259,6 +280,11 @@ impl Gemma4Weights {
         let vocabulary = required_array_length(gguf, "tokenizer.ggml.tokens")?;
         let token_embedding = required_tensor(gguf, "token_embd.weight", &[hidden, vocabulary])?;
         let output_norm = required_tensor(gguf, "output_norm.weight", &[hidden])?;
+        let rope_frequencies = required_tensor(
+            gguf,
+            "rope_freqs.weight",
+            &[u64::from(config.rope_dimensions) / 2],
+        )?;
         let (output, tied_output) = match tensor_index(gguf, "output.weight") {
             Some(index) => {
                 validate_shape(gguf, index, &[hidden, vocabulary])?;
@@ -329,6 +355,11 @@ impl Gemma4Weights {
                     &name("ffn_down.weight"),
                     &[u64::from(config.feed_forward_length), hidden],
                 )?,
+                shared_post_norm: required_tensor(
+                    gguf,
+                    &name("post_ffw_norm_1.weight"),
+                    &[hidden],
+                )?,
                 post_feed_forward_norm: required_tensor(
                     gguf,
                     &name("post_ffw_norm.weight"),
@@ -381,6 +412,7 @@ impl Gemma4Weights {
             token_embedding,
             output_norm,
             output,
+            rope_frequencies,
             tied_output,
             layers,
         })
