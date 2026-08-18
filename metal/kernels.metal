@@ -91,8 +91,9 @@ kernel void gelu_mul(
     if (index < count) {
         const float value = gate[index];
         const float cubic = value * value * value;
+        const float argument = 0.7978846f * (value + 0.044715f * cubic);
         const float gelu = 0.5f * value
-            * (1.0f + tanh(0.7978846f * (value + 0.044715f * cubic)));
+            * (1.0f + tanh(clamp(argument, -10.0f, 10.0f)));
         output[index] = gelu * up[index];
     }
 }

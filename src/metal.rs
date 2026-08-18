@@ -907,56 +907,73 @@ mod implementation {
                     (columns, encoded)
                 }
                 TensorType::Q5_0 => {
-                    let mut encoded = Vec::with_capacity(rows * 22);
+                    let blocks = 3;
+                    let mut encoded = Vec::with_capacity(rows * blocks * 22);
                     for row in 0..rows {
-                        let mut block = [0_u8; 22];
-                        block[..2].copy_from_slice(&0x3400_u16.to_le_bytes());
-                        for (index, value) in block[2..].iter_mut().enumerate() {
-                            *value = (index * 29 + row * 47 + 3) as u8;
+                        for block_index in 0..blocks {
+                            let mut block = [0_u8; 22];
+                            block[..2].copy_from_slice(&0x3400_u16.to_le_bytes());
+                            for (index, value) in block[2..].iter_mut().enumerate() {
+                                *value = (index * 29 + row * 47 + block_index * 13 + 3) as u8;
+                            }
+                            encoded.extend_from_slice(&block);
                         }
-                        encoded.extend_from_slice(&block);
                     }
-                    (32, encoded)
+                    (32 * blocks, encoded)
                 }
                 TensorType::Q8_0 => {
-                    let mut encoded = Vec::with_capacity(rows * 34);
+                    let blocks = 3;
+                    let mut encoded = Vec::with_capacity(rows * blocks * 34);
                     for row in 0..rows {
-                        let mut block = [0_u8; 34];
-                        block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
-                        for (index, value) in block[2..].iter_mut().enumerate() {
-                            *value = (index as i16 * 7 - 101 + row as i16 * 11) as i8 as u8;
+                        for block_index in 0..blocks {
+                            let mut block = [0_u8; 34];
+                            block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+                            for (index, value) in block[2..].iter_mut().enumerate() {
+                                *value = (index as i16 * 7 - 101
+                                    + row as i16 * 11
+                                    + block_index as i16 * 17)
+                                    as i8 as u8;
+                            }
+                            encoded.extend_from_slice(&block);
                         }
-                        encoded.extend_from_slice(&block);
                     }
-                    (32, encoded)
+                    (32 * blocks, encoded)
                 }
                 TensorType::Q4K => {
-                    let mut encoded = Vec::with_capacity(rows * 144);
+                    let blocks = 3;
+                    let mut encoded = Vec::with_capacity(rows * blocks * 144);
                     for row in 0..rows {
-                        let mut block = [0_u8; 144];
-                        block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
-                        block[2..4].copy_from_slice(&0x2800_u16.to_le_bytes());
-                        for (index, value) in block[4..].iter_mut().enumerate() {
-                            *value = (index * 19 + row * 31 + 5) as u8;
+                        for block_index in 0..blocks {
+                            let mut block = [0_u8; 144];
+                            block[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+                            block[2..4].copy_from_slice(&0x2800_u16.to_le_bytes());
+                            for (index, value) in block[4..].iter_mut().enumerate() {
+                                *value = (index * 19 + row * 31 + block_index * 43 + 5) as u8;
+                            }
+                            encoded.extend_from_slice(&block);
                         }
-                        encoded.extend_from_slice(&block);
                     }
-                    (256, encoded)
+                    (256 * blocks, encoded)
                 }
                 TensorType::Q6K => {
-                    let mut encoded = Vec::with_capacity(rows * 210);
+                    let blocks = 3;
+                    let mut encoded = Vec::with_capacity(rows * blocks * 210);
                     for row in 0..rows {
-                        let mut block = [0_u8; 210];
-                        for (index, value) in block[..192].iter_mut().enumerate() {
-                            *value = (index * 23 + row * 37 + 11) as u8;
+                        for block_index in 0..blocks {
+                            let mut block = [0_u8; 210];
+                            for (index, value) in block[..192].iter_mut().enumerate() {
+                                *value = (index * 23 + row * 37 + block_index * 41 + 11) as u8;
+                            }
+                            for (index, value) in block[192..208].iter_mut().enumerate() {
+                                *value =
+                                    (index as i8 * 5 - 37 + row as i8 * 3 + block_index as i8 * 7)
+                                        as u8;
+                            }
+                            block[208..].copy_from_slice(&0x2800_u16.to_le_bytes());
+                            encoded.extend_from_slice(&block);
                         }
-                        for (index, value) in block[192..208].iter_mut().enumerate() {
-                            *value = (index as i8 * 5 - 37 + row as i8 * 3) as u8;
-                        }
-                        block[208..].copy_from_slice(&0x2800_u16.to_le_bytes());
-                        encoded.extend_from_slice(&block);
                     }
-                    (256, encoded)
+                    (256 * blocks, encoded)
                 }
                 _ => unreachable!("fixture only covers Metal-supported tensor types"),
             }
@@ -1019,6 +1036,19 @@ mod implementation {
             let mut actual_gelu = vec![0.0; gate.len()];
             context.gelu_mul(&gate, &up, &mut actual_gelu).unwrap();
             assert_close(&actual_gelu, &expected_gelu, 2.0e-6);
+
+            let large_gate = [-80.0, -51.0, 37.0, 66.0, 90.0];
+            let large_up = [2.0, -3.0, 4.0, -5.0, 6.0];
+            let expected_large: Vec<_> = large_gate
+                .iter()
+                .zip(large_up)
+                .map(|(gate, up)| cpu::gelu_tanh(*gate) * up)
+                .collect();
+            let mut actual_large = [0.0; 5];
+            context
+                .gelu_mul(&large_gate, &large_up, &mut actual_large)
+                .unwrap();
+            assert_close(&actual_large, &expected_large, 2.0e-5);
 
             let mut expected_softmax = input.clone();
             cpu::softmax_in_place(&mut expected_softmax).unwrap();

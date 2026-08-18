@@ -1,6 +1,8 @@
 //! Gemma 4 architecture metadata, tokenizer, and chat framing.
 
 pub mod cpu;
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 

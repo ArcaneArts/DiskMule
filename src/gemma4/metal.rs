@@ -1,127 +1,28 @@
-//! Deterministic Gemma 4 CPU reference execution.
+//! Gemma 4 execution backed by the validated Metal operators.
 
-use std::{
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Instant};
 
 use crate::{
-    cpu::{
-        self, argmax, gelu_tanh, rms_norm, rope_neox_in_place, softcap_in_place, softmax_in_place,
-        tensor_expert_matvec, tensor_matvec, tensor_row, tensor_vector, top_k_softmax,
-    },
-    gemma4::{Gemma4Config, Gemma4Error, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS},
-    gguf::{GgufError, TensorSource},
+    cpu::{tensor_row, tensor_vector},
+    gemma4::{Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS},
+    gguf::TensorSource,
+    metal::MetalContext,
 };
 
-#[cfg(target_os = "macos")]
-use crate::metal::MetalError;
-
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeError {
-    #[error(transparent)]
-    Gguf(#[from] GgufError),
-
-    #[error(transparent)]
-    Architecture(#[from] Gemma4Error),
-
-    #[error(transparent)]
-    Cpu(#[from] cpu::CpuError),
-
-    #[cfg(target_os = "macos")]
-    #[error(transparent)]
-    Metal(#[from] MetalError),
-
-    #[error("generation requires at least one prompt token")]
-    EmptyPrompt,
-
-    #[error("token ID {token} is outside the {vocabulary}-token vocabulary")]
-    InvalidToken { token: u32, vocabulary: usize },
-
-    #[error("context would grow to {requested} tokens, exceeding the configured limit {limit}")]
-    ContextLimit { requested: usize, limit: usize },
-
-    #[error("KV cache is at position {actual}; expected {expected}")]
-    CachePosition { expected: usize, actual: usize },
-
-    #[error("generation was cancelled")]
-    Cancelled,
-
-    #[error("unsupported proportional-RoPE frequency-factor layout")]
-    UnsupportedRopeFactors,
-
-    #[error("tensor {tensor:?} produced a non-finite Metal result")]
-    NonFiniteMetalTensor { tensor: String },
-
-    #[error("tensor {tensor:?} received a non-finite Metal input")]
-    NonFiniteMetalInput { tensor: String },
-
-    #[error(
-        "Metal {operation} produced a non-finite activation (left max {left_max}, right max {right_max})"
-    )]
-    NonFiniteMetalActivation {
-        operation: String,
-        left_max: f32,
-        right_max: f32,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CancellationFlag(Arc<AtomicBool>);
-
-impl CancellationFlag {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-
-    pub(super) fn check(&self) -> Result<(), RuntimeError> {
-        if self.is_cancelled() {
-            Err(RuntimeError::Cancelled)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GenerationProfile {
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub mapped_bytes_touched: u64,
-    pub embedding_time: Duration,
-    pub attention_time: Duration,
-    pub feed_forward_time: Duration,
-    pub output_time: Duration,
-    pub total_time: Duration,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct GenerationResult {
-    pub token_ids: Vec<u32>,
-    pub text: String,
-    pub stopped: bool,
-    pub profile: GenerationProfile,
-}
+use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, KvCache, RuntimeError};
 
 #[derive(Debug)]
-pub struct Gemma4CpuModel {
+pub struct Gemma4MetalModel {
     source: TensorSource,
     pub config: Gemma4Config,
     pub tokenizer: Gemma4Tokenizer,
     pub weights: Gemma4Weights,
+    metal: MetalContext,
     max_context: usize,
     full_rope_pairs: usize,
 }
 
-impl Gemma4CpuModel {
+impl Gemma4MetalModel {
     pub fn open(path: impl AsRef<Path>, max_context: usize) -> Result<Self, RuntimeError> {
         let mut source = TensorSource::open_with_arrays(path, RUNTIME_ARRAY_KEYS)?;
         let config = Gemma4Config::from_gguf(&source.gguf)?;
@@ -147,11 +48,13 @@ impl Gemma4CpuModel {
                 limit: 0,
             });
         }
+        let metal = MetalContext::new()?;
         Ok(Self {
             source,
             config,
             tokenizer,
             weights,
+            metal,
             max_context,
             full_rope_pairs,
         })
@@ -159,6 +62,10 @@ impl Gemma4CpuModel {
 
     pub fn source(&self) -> &TensorSource {
         &self.source
+    }
+
+    pub fn device_name(&self) -> String {
+        self.metal.device_name()
     }
 
     pub fn new_cache(&self) -> KvCache {
@@ -198,12 +105,11 @@ impl Gemma4CpuModel {
             ..GenerationProfile::default()
         };
         let mut logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
-
         let mut generated = Vec::with_capacity(maximum_new_tokens);
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
-            let next = argmax(&logits)? as u32;
+            let next = self.metal.argmax(&logits)? as u32;
             if self.tokenizer.stop_token_ids.contains(&next) {
                 stopped = true;
                 break;
@@ -235,7 +141,6 @@ impl Gemma4CpuModel {
         })
     }
 
-    /// Compute deterministic, softcapped next-token logits for one prompt.
     pub fn prompt_logits(
         &self,
         prompt_tokens: &[u32],
@@ -311,7 +216,6 @@ impl Gemma4CpuModel {
                 actual,
             });
         }
-
         let result = self.forward_token_inner(
             token,
             position,
@@ -380,29 +284,11 @@ impl Gemma4CpuModel {
             let query_norm = self.vector(layer.query_norm, head_dimension, profile)?;
             let key_norm = self.vector(layer.key_norm, head_dimension, profile)?;
             let query_input = query.clone();
-            normalize_heads(
-                &query_input,
-                Some(&query_norm),
-                self.config.rms_epsilon,
-                head_dimension,
-                &mut query,
-            )?;
+            self.normalize_heads(&query_input, Some(&query_norm), head_dimension, &mut query)?;
             let key_input = key.clone();
-            normalize_heads(
-                &key_input,
-                Some(&key_norm),
-                self.config.rms_epsilon,
-                head_dimension,
-                &mut key,
-            )?;
+            self.normalize_heads(&key_input, Some(&key_norm), head_dimension, &mut key)?;
             let value_input = value.clone();
-            normalize_heads(
-                &value_input,
-                None,
-                self.config.rms_epsilon,
-                head_dimension,
-                &mut value,
-            )?;
+            self.normalize_heads(&value_input, None, head_dimension, &mut value)?;
             let rotated_pairs = if sliding {
                 self.config.rope_dimensions_swa as usize / 2
             } else {
@@ -413,7 +299,7 @@ impl Gemma4CpuModel {
             } else {
                 self.config.rope_frequency_base
             };
-            rope_neox_in_place(
+            self.metal.rope_neox_in_place(
                 &mut query,
                 query_heads,
                 head_dimension,
@@ -421,7 +307,7 @@ impl Gemma4CpuModel {
                 position,
                 rope_theta,
             )?;
-            rope_neox_in_place(
+            self.metal.rope_neox_in_place(
                 &mut key,
                 kv_heads,
                 head_dimension,
@@ -430,13 +316,17 @@ impl Gemma4CpuModel {
                 rope_theta,
             )?;
             cache.layers[layer_index].append(position, &key, &value)?;
-            let attention = attend(
+            let layer_cache = &cache.layers[layer_index];
+            let mut attention = vec![0.0_f32; query.len()];
+            self.metal.attention(
                 &query,
-                &cache.layers[layer_index],
+                &layer_cache.keys,
+                &layer_cache.values,
                 query_heads,
                 kv_heads,
                 head_dimension,
                 sliding.then_some(self.config.sliding_window as usize),
+                &mut attention,
             )?;
             let mut projected_attention = vec![0.0_f32; hidden_size];
             self.matvec(
@@ -447,7 +337,7 @@ impl Gemma4CpuModel {
             )?;
             let projected_attention =
                 self.weighted_norm(&projected_attention, layer.post_attention_norm, profile)?;
-            let attention_output = add(&residual, &projected_attention);
+            let attention_output = self.add(&residual, &projected_attention)?;
             profile.attention_time += attention_started.elapsed();
 
             let feed_forward_started = Instant::now();
@@ -466,7 +356,7 @@ impl Gemma4CpuModel {
             let routed_input =
                 self.weighted_norm(&attention_output, layer.routed_pre_norm, profile)?;
             let mut router_input = vec![0.0_f32; hidden_size];
-            rms_norm(
+            self.metal.rms_norm(
                 &attention_output,
                 None,
                 self.config.rms_epsilon,
@@ -479,7 +369,9 @@ impl Gemma4CpuModel {
             }
             let mut routing_logits = vec![0.0_f32; self.config.expert_count as usize];
             self.matvec(layer.router, &router_input, &mut routing_logits, profile)?;
-            let selected = top_k_softmax(&routing_logits, self.config.experts_used as usize)?;
+            let selected = self
+                .metal
+                .top_k_softmax(&routing_logits, self.config.experts_used as usize)?;
             let expert_scale = self.vector(
                 layer.expert_down_scale,
                 self.config.expert_count as usize,
@@ -498,11 +390,14 @@ impl Gemma4CpuModel {
                     profile,
                 )?;
                 let (gate, up) = gate_up.split_at(expert_width);
-                let activated: Vec<_> = gate
-                    .iter()
-                    .zip(up)
-                    .map(|(gate, up)| gelu_tanh(*gate) * up)
-                    .collect();
+                let mut activated = vec![0.0_f32; expert_width];
+                self.metal.gelu_mul(gate, up, &mut activated)?;
+                self.require_finite_activation(
+                    &format!("layer {layer_index} expert {expert} GELU"),
+                    gate,
+                    up,
+                    &activated,
+                )?;
                 let mut expert_output = vec![0.0_f32; hidden_size];
                 self.expert_matvec(
                     layer.expert_down,
@@ -517,9 +412,9 @@ impl Gemma4CpuModel {
                 }
             }
             let routed = self.weighted_norm(&routed, layer.routed_post_norm, profile)?;
-            let combined = add(&shared, &routed);
+            let combined = self.add(&shared, &routed)?;
             let combined = self.weighted_norm(&combined, layer.post_feed_forward_norm, profile)?;
-            hidden = add(&attention_output, &combined);
+            hidden = self.add(&attention_output, &combined)?;
             let layer_scale = self.vector(layer.layer_output_scale, 1, profile)?[0];
             for value in &mut hidden {
                 *value *= layer_scale;
@@ -535,7 +430,10 @@ impl Gemma4CpuModel {
         let normalized = self.weighted_norm(&hidden, self.weights.output_norm, profile)?;
         let mut logits = vec![0.0_f32; self.tokenizer.vocab_size()];
         self.matvec(self.weights.output, &normalized, &mut logits, profile)?;
-        softcap_in_place(&mut logits, self.config.final_logit_softcap)?;
+        let raw_logits = logits;
+        let mut logits = vec![0.0_f32; raw_logits.len()];
+        self.metal
+            .softcap(&raw_logits, self.config.final_logit_softcap, &mut logits)?;
         profile.output_time += output_started.elapsed();
         Ok(Some(logits))
     }
@@ -562,8 +460,39 @@ impl Gemma4CpuModel {
     ) -> Result<Vec<f32>, RuntimeError> {
         let weight = self.vector(weight_index, input.len(), profile)?;
         let mut output = vec![0.0_f32; input.len()];
-        rms_norm(input, Some(&weight), self.config.rms_epsilon, &mut output)?;
+        self.metal
+            .rms_norm(input, Some(&weight), self.config.rms_epsilon, &mut output)?;
         Ok(output)
+    }
+
+    fn normalize_heads(
+        &self,
+        input: &[f32],
+        weight: Option<&[f32]>,
+        head_dimension: usize,
+        output: &mut [f32],
+    ) -> Result<(), RuntimeError> {
+        if head_dimension == 0
+            || weight.is_some_and(|weight| weight.len() != head_dimension)
+            || !input.len().is_multiple_of(head_dimension)
+            || output.len() != input.len()
+        {
+            return Err(crate::metal::MetalError::InvalidVectorLength {
+                operation: "per-head RMSNorm",
+                argument: "output",
+                expected: input.len(),
+                actual: output.len(),
+            }
+            .into());
+        }
+        for (input, output) in input
+            .chunks_exact(head_dimension)
+            .zip(output.chunks_exact_mut(head_dimension))
+        {
+            self.metal
+                .rms_norm(input, weight, self.config.rms_epsilon, output)?;
+        }
+        Ok(())
     }
 
     fn matvec(
@@ -573,10 +502,31 @@ impl Gemma4CpuModel {
         output: &mut [f32],
         profile: &mut GenerationProfile,
     ) -> Result<(), RuntimeError> {
-        tensor_matvec(&self.source, index, input, output)?;
-        profile.mapped_bytes_touched = profile
-            .mapped_bytes_touched
-            .saturating_add(self.source.gguf.tensors[index].byte_len);
+        let tensor = &self.source.gguf.tensors[index];
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalInput {
+                tensor: format!("{} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
+        self.metal.matvec(
+            tensor.kind,
+            dimension(tensor.dimensions[1])?,
+            dimension(tensor.dimensions[0])?,
+            self.source.tensor_bytes_by_index(index).ok_or(
+                crate::cpu::CpuError::InvalidTensorIndex {
+                    index,
+                    count: self.source.gguf.tensors.len(),
+                },
+            )?,
+            input,
+            output,
+        )?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalTensor {
+                tensor: format!("{} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
+        profile.mapped_bytes_touched = profile.mapped_bytes_touched.saturating_add(tensor.byte_len);
         Ok(())
     }
 
@@ -588,11 +538,56 @@ impl Gemma4CpuModel {
         output: &mut [f32],
         profile: &mut GenerationProfile,
     ) -> Result<(), RuntimeError> {
-        tensor_expert_matvec(&self.source, index, expert, input, output)?;
-        let experts = self.source.gguf.tensors[index].dimensions[2];
+        let tensor = &self.source.gguf.tensors[index];
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalInput {
+                tensor: format!("{} expert {expert} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
+        let columns = dimension(tensor.dimensions[0])?;
+        let rows = dimension(tensor.dimensions[1])?;
+        let experts = dimension(tensor.dimensions[2])?;
+        if expert >= experts {
+            return Err(crate::cpu::CpuError::InvalidTensorExpert {
+                tensor: tensor.name.clone(),
+                expert,
+                experts,
+            }
+            .into());
+        }
+        let row_bytes = tensor
+            .kind
+            .row_byte_len(tensor.dimensions[0])
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or(crate::metal::MetalError::Overflow)?;
+        let expert_bytes = rows
+            .checked_mul(row_bytes)
+            .ok_or(crate::metal::MetalError::Overflow)?;
+        let start = expert
+            .checked_mul(expert_bytes)
+            .ok_or(crate::metal::MetalError::Overflow)?;
+        let bytes = self.source.tensor_bytes_by_index(index).ok_or(
+            crate::cpu::CpuError::InvalidTensorIndex {
+                index,
+                count: self.source.gguf.tensors.len(),
+            },
+        )?;
+        self.metal.matvec(
+            tensor.kind,
+            rows,
+            columns,
+            &bytes[start..start + expert_bytes],
+            input,
+            output,
+        )?;
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalTensor {
+                tensor: format!("{} expert {expert} ({})", tensor.name, tensor.kind.name()),
+            });
+        }
         profile.mapped_bytes_touched = profile
             .mapped_bytes_touched
-            .saturating_add(self.source.gguf.tensors[index].byte_len / experts);
+            .saturating_add(tensor.byte_len / experts as u64);
         Ok(())
     }
 
@@ -609,12 +604,35 @@ impl Gemma4CpuModel {
         let mut up = vec![0.0_f32; width];
         self.matvec(gate_index, input, &mut gate, profile)?;
         self.matvec(up_index, input, &mut up, profile)?;
-        for (gate, up) in gate.iter_mut().zip(up) {
-            *gate = gelu_tanh(*gate) * up;
-        }
+        let mut activated = vec![0.0_f32; width];
+        self.metal.gelu_mul(&gate, &up, &mut activated)?;
+        self.require_finite_activation("shared GELU", &gate, &up, &activated)?;
         let mut output = vec![0.0_f32; self.config.hidden_size as usize];
-        self.matvec(down_index, &gate, &mut output, profile)?;
+        self.matvec(down_index, &activated, &mut output, profile)?;
         Ok(output)
+    }
+
+    fn add(&self, left: &[f32], right: &[f32]) -> Result<Vec<f32>, RuntimeError> {
+        let mut output = vec![0.0_f32; left.len()];
+        self.metal.add(left, right, &mut output)?;
+        Ok(output)
+    }
+
+    fn require_finite_activation(
+        &self,
+        operation: &str,
+        left: &[f32],
+        right: &[f32],
+        output: &[f32],
+    ) -> Result<(), RuntimeError> {
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(RuntimeError::NonFiniteMetalActivation {
+                operation: operation.to_owned(),
+                left_max: maximum_magnitude(left),
+                right_max: maximum_magnitude(right),
+            });
+        }
+        Ok(())
     }
 
     fn tensor_row_bytes(&self, index: usize) -> u64 {
@@ -626,245 +644,10 @@ impl Gemma4CpuModel {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct KvCache {
-    pub(super) layers: Vec<LayerKv>,
-    max_context: usize,
+fn dimension(value: u64) -> Result<usize, RuntimeError> {
+    usize::try_from(value).map_err(|_| crate::metal::MetalError::Overflow.into())
 }
 
-impl KvCache {
-    pub(super) fn new(config: &Gemma4Config, max_context: usize) -> Self {
-        let layers = config
-            .sliding_layers
-            .iter()
-            .enumerate()
-            .map(|(layer, sliding)| {
-                let head_dimension = if *sliding {
-                    config.key_length_swa as usize
-                } else {
-                    config.key_length as usize
-                };
-                LayerKv::new(config.kv_heads_by_layer[layer] as usize * head_dimension)
-            })
-            .collect();
-        Self {
-            layers,
-            max_context,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.layers.first().map_or(0, LayerKv::len)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn max_context(&self) -> usize {
-        self.max_context
-    }
-
-    pub fn clear(&mut self) {
-        self.truncate(0);
-    }
-
-    pub(super) fn position(&self) -> Result<usize, RuntimeError> {
-        let position = self.len();
-        if self.layers.iter().all(|layer| layer.len() == position) {
-            Ok(position)
-        } else {
-            Err(RuntimeError::CachePosition {
-                expected: position,
-                actual: self
-                    .layers
-                    .iter()
-                    .map(LayerKv::len)
-                    .find(|length| *length != position)
-                    .unwrap_or(position),
-            })
-        }
-    }
-
-    pub(super) fn truncate(&mut self, length: usize) {
-        for layer in &mut self.layers {
-            layer.truncate(length);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct LayerKv {
-    pub(super) width: usize,
-    pub(super) keys: Vec<f32>,
-    pub(super) values: Vec<f32>,
-}
-
-impl LayerKv {
-    fn new(width: usize) -> Self {
-        Self {
-            width,
-            keys: Vec::new(),
-            values: Vec::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.keys.len() / self.width
-    }
-
-    pub(super) fn append(
-        &mut self,
-        position: usize,
-        key: &[f32],
-        value: &[f32],
-    ) -> Result<(), RuntimeError> {
-        let actual = self.len();
-        if actual != position {
-            return Err(RuntimeError::CachePosition {
-                expected: position,
-                actual,
-            });
-        }
-        if key.len() != self.width || value.len() != self.width {
-            return Err(RuntimeError::CachePosition {
-                expected: self.width,
-                actual: key.len().min(value.len()),
-            });
-        }
-        self.keys.extend_from_slice(key);
-        self.values.extend_from_slice(value);
-        Ok(())
-    }
-
-    fn truncate(&mut self, length: usize) {
-        self.keys.truncate(length.saturating_mul(self.width));
-        self.values.truncate(length.saturating_mul(self.width));
-    }
-}
-
-fn normalize_heads(
-    input: &[f32],
-    weight: Option<&[f32]>,
-    epsilon: f32,
-    head_dimension: usize,
-    output: &mut [f32],
-) -> Result<(), cpu::CpuError> {
-    if head_dimension == 0
-        || weight.is_some_and(|weight| weight.len() != head_dimension)
-        || !input.len().is_multiple_of(head_dimension)
-        || output.len() != input.len()
-    {
-        return Err(cpu::CpuError::InvalidVectorLength {
-            operation: "per-head RMSNorm",
-            argument: "output",
-            expected: input.len(),
-            actual: output.len(),
-        });
-    }
-    for (input, output) in input
-        .chunks_exact(head_dimension)
-        .zip(output.chunks_exact_mut(head_dimension))
-    {
-        rms_norm(input, weight, epsilon, output)?;
-    }
-    Ok(())
-}
-
-fn attend(
-    query: &[f32],
-    cache: &LayerKv,
-    query_heads: usize,
-    kv_heads: usize,
-    head_dimension: usize,
-    window: Option<usize>,
-) -> Result<Vec<f32>, cpu::CpuError> {
-    let sequence_length = cache.len();
-    if sequence_length == 0 {
-        return Err(cpu::CpuError::EmptyInput {
-            operation: "attention",
-        });
-    }
-    let group_size = query_heads / kv_heads;
-    let start = window.map_or(0, |window| sequence_length.saturating_sub(window));
-    let mut output = vec![0.0_f32; query.len()];
-    for query_head in 0..query_heads {
-        let kv_head = query_head / group_size;
-        let query_start = query_head * head_dimension;
-        let query = &query[query_start..query_start + head_dimension];
-        let mut scores = Vec::with_capacity(sequence_length - start);
-        for position in start..sequence_length {
-            let key_start = position * cache.width + kv_head * head_dimension;
-            let key = &cache.keys[key_start..key_start + head_dimension];
-            scores.push(
-                query
-                    .iter()
-                    .zip(key)
-                    .fold(0.0_f32, |sum, (query, key)| query.mul_add(*key, sum)),
-            );
-        }
-        softmax_in_place(&mut scores)?;
-        let output = &mut output[query_start..query_start + head_dimension];
-        for (score_index, probability) in scores.into_iter().enumerate() {
-            let position = start + score_index;
-            let value_start = position * cache.width + kv_head * head_dimension;
-            let value = &cache.values[value_start..value_start + head_dimension];
-            for (output, value) in output.iter_mut().zip(value) {
-                *output = value.mul_add(probability, *output);
-            }
-        }
-    }
-    Ok(output)
-}
-
-fn add(left: &[f32], right: &[f32]) -> Vec<f32> {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| left + right)
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CancellationFlag, LayerKv, RuntimeError, attend};
-
-    #[test]
-    fn cancellation_is_shared_and_observable() {
-        let flag = CancellationFlag::default();
-        let clone = flag.clone();
-        assert!(!clone.is_cancelled());
-        flag.cancel();
-        assert!(clone.is_cancelled());
-        assert!(matches!(clone.check(), Err(RuntimeError::Cancelled)));
-    }
-
-    #[test]
-    fn grouped_attention_uses_the_matching_kv_head() {
-        let mut cache = LayerKv::new(4);
-        cache
-            .append(0, &[1.0, 0.0, 0.0, 1.0], &[2.0, 3.0, 5.0, 7.0])
-            .unwrap();
-        let query = [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
-        let output = attend(&query, &cache, 4, 2, 2, None).unwrap();
-        assert_eq!(output, [2.0, 3.0, 2.0, 3.0, 5.0, 7.0, 5.0, 7.0]);
-    }
-
-    #[test]
-    fn sliding_attention_ignores_values_outside_the_window() {
-        let mut cache = LayerKv::new(2);
-        cache.append(0, &[1.0, 0.0], &[100.0, 100.0]).unwrap();
-        cache.append(1, &[1.0, 0.0], &[2.0, 4.0]).unwrap();
-        let output = attend(&[1.0, 0.0], &cache, 1, 1, 2, Some(1)).unwrap();
-        assert_eq!(output, [2.0, 4.0]);
-    }
-
-    #[test]
-    fn failed_append_does_not_mutate_the_cache() {
-        let mut cache = LayerKv::new(2);
-        assert!(matches!(
-            cache.append(1, &[1.0, 0.0], &[1.0, 0.0]),
-            Err(RuntimeError::CachePosition { .. })
-        ));
-        assert_eq!(cache.len(), 0);
-    }
+fn maximum_magnitude(values: &[f32]) -> f32 {
+    values.iter().copied().map(f32::abs).fold(0.0, f32::max)
 }
