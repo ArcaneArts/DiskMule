@@ -126,6 +126,38 @@ The intended hierarchy should be:
 4. Remaining experts on NVMe, loaded by explicit parallel reads.
 5. The macOS file cache only as an opportunistic bonus when buffered I/O is enabled.
 
+## DiskMule Metal and streamed-expert findings
+
+The Phase 3 Metal backend uses the maintained `objc2-metal` bindings and runtime
+MSL compilation. The command-line Metal compiler is not installed on this host,
+but framework compilation and dispatch work on the Apple M4 Max. DiskMule's
+shared allocations use host-page-aligned no-copy buffers with explicit retained
+deallocators. The immutable GGUF is wrapped once through a lifetime-owning
+no-copy Metal view, and real tensors dispatch at validated nonzero 64-bit file
+offsets.
+
+Metal's fast `tanh` returned non-finite values for the large cubic argument in
+Gemma's tanh-GELU approximation even though the activation itself was valid.
+Clamping the tanh argument to `[-10, 10]` matches saturated FP32 CPU behavior
+and restored full-graph parity. The regression fixture includes gate values up
+to magnitude 90.
+
+For routed experts, `ExpertResidency::Mapped` uses the retained GGUF mapping.
+`ExpertResidency::Streamed` instead reads the selected expert's exact encoded
+gate/up and down ranges into reusable per-layer Metal-visible slots. The two
+reads run in bounded parallel, the deterministic LRU chooses only unpinned
+slots, and the slot is pinned until both synchronous GPU projections finish.
+The one-slot real-model oracle is intentionally smaller than top-8 routing and
+therefore forces eviction and storage reads without changing precision or
+semantics.
+
+The retained benchmark at commit `72cf6d0` records exact conditions and results
+in `benchmarks/2026-08-18-gemma4-m4-max.md`. Warm mapped Metal produced a
+326.6 ms TTFT and about 3.12 decode tokens/s for the tiny BOS fixture. Forced
+one-slot streaming produced a 380.2 ms TTFT and about 2.80 decode tokens/s,
+with zero resident/streamed logit error. These are warm local measurements, not
+SSD or cross-machine claims.
+
 Colibri already has a learned hot store (`PIN=auto`, `PIN_GB`, `AUTOPIN`) and per-layer cache slots. On macOS it can `mlock` the application-owned cache so the memory compressor does not unexpectedly reclaim/compress the hot working set.
 
 Compare buffered reads with `DIRECT=1`. On macOS, Colibri maps the direct setting to `F_NOCACHE`. Direct I/O gives the application more control and can avoid duplicate file-cache residency, but performance is SSD- and workload-dependent. Measure both paths instead of assuming direct I/O always wins.

@@ -205,6 +205,8 @@ response and handled clear and exit commands.
 
 ### Phase 3: Metal Gemma 4 inference
 
+Status: complete on 2026-08-18 for the pinned local `gemma4:26b` GGUF.
+
 - Establish Metal device, command queue, pipeline, and shared-buffer ownership.
 - Implement and validate quantized Q4_K_M GEMV, normalization, attention, router,
   expert, and output kernels as required by the model.
@@ -215,7 +217,19 @@ response and handled clear and exit commands.
 Exit criterion: `diskmule run gemma4:26b` provides a stable interactive chat on
 the M4 Max using DiskMule's own Rust runtime and Metal kernels.
 
+Evidence: DiskMule owns the Metal device, runtime-compiled shader library,
+pipelines, command queue, page-aligned shared allocations, mapped-weight view,
+and synchronous command-buffer lifetimes. F32, F16, Q5_0, Q8_0, Q4_K, and Q6_K
+GEMV plus Gemma norms, RoPE, attention, softmax, routing, experts, reductions,
+and output operations have CPU parity fixtures. On the real 17 GB model, the
+maximum CPU/Metal error across all logits is `0.00014209747` under a `0.001`
+tolerance, and four greedy tokens match exactly. Metal weight residency reduced
+the observed four-token run from roughly 2.43 seconds with transient weight
+copies to roughly 1.31 seconds with the retained no-copy GGUF mapping.
+
 ### Phase 4: forced expert streaming on Gemma 4
+
+Status: complete on 2026-08-18 for mapped and forced one-slot Metal execution.
 
 - Separate always-resident tensors from routed-expert tensors.
 - Implement reusable page-aligned, Metal-visible expert slots filled through
@@ -227,6 +241,16 @@ the M4 Max using DiskMule's own Rust runtime and Metal kernels.
 
 Exit criterion: resident and streamed Gemma 4 execution remain numerically
 equivalent while metrics expose hits, misses, bytes read, and I/O wait.
+
+Evidence: each layer owns a deterministic LRU cache of reusable page-aligned
+Metal-visible gate/up and down slots. Misses issue two bounded parallel
+positional reads, slots remain pinned through synchronous GPU consumption, and
+cancellation is checked before and after I/O. Fully mapped and explicit
+streaming modes use identical precision and kernels. A real one-slot-per-layer
+run produced zero resident/streamed logit error and the same four greedy tokens;
+its profile recorded hits, misses, evictions, reads, bytes, I/O wait, expert
+residency, and bounded ring-buffer KV residency. Detailed conditions and raw
+figures are retained in `benchmarks/2026-08-18-gemma4-m4-max.md`.
 
 ### Phase 5: chat polish and local server
 
@@ -279,8 +303,9 @@ server, CLI, or session code unless it introduces a genuinely new capability.
 
 ## Current milestone
 
-Build Phase 3 Metal inference without weakening the proven CPU oracle or model
-ownership boundary. These commands already work:
+Build Phase 5's shared production inference surface without weakening the
+proven CPU, Metal, storage-backed expert, or model ownership boundaries. These
+commands already work:
 
 ```text
 diskmule ls
@@ -289,7 +314,8 @@ diskmule rm gemma4:26b
 diskmule --serve
 ```
 
-`ls` identifies the Ollama-owned Gemma model, `run` provides CPU chat, `rm`
-safely refuses external deletion, and `--serve` provides a minimal health
-endpoint. Phase 3 must add DiskMule-owned Metal execution with per-operation and
-end-to-end parity before it becomes the default chat backend.
+`ls` identifies the Ollama-owned Gemma model, `run` provides Metal chat on
+supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
+external deletion, and `--serve` provides a minimal health endpoint. Phase 5
+must make CLI and HTTP clients share bounded sessions, streaming, cancellation,
+and generation configuration.

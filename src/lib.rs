@@ -78,7 +78,7 @@ pub async fn execute_with_io(
                     record.name
                 ))
             })?;
-            chat::run_gemma4_cpu(path, input, output)?;
+            chat::run_gemma4(path, input, output)?;
         }
         Action::List => {
             let catalog = ModelCatalog::discover(paths, config::ollama_models_dir()?)?;

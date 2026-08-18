@@ -5,12 +5,12 @@ Silicon. Its long-term purpose is to run multiple explicitly supported model
 families while keeping very large routed-expert pools on storage. Rust owns the
 host runtime and GPU kernels will be written in Metal Shading Language.
 
-The current implementation includes the model-management boundary and a
-complete deterministic Gemma 4 26B CPU reference path. It can inspect and map
-GGUF tensors, discover local Ollama models without copying them, safely manage
-DiskMule-owned entries, run streaming terminal chat, and serve a health
-endpoint. Metal inference, explicit expert streaming, and generation APIs are
-the next active phases.
+The current implementation includes the model-management boundary plus complete
+deterministic Gemma 4 26B CPU and Metal paths. It can inspect and map GGUF
+tensors, discover local Ollama models without copying them, safely manage
+DiskMule-owned entries, run streaming terminal chat, retain bounded Metal KV
+state, and force routed experts through an explicit storage-backed cache. The
+shared CLI/server generation surface is the next active phase.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
 for the Colibri and TurboFieldfare research behind it.
@@ -49,12 +49,17 @@ diskmule run /path/to/model.gguf
 
 `run` prints the resolved model details and starts an EOF-safe terminal loop.
 Enter `/clear` to reset history, `/help` for local commands, or `/bye` to exit.
-Generation is greedy and streams through DiskMule's own CPU runtime. Two
-temporary development controls bound generation while the richer Phase 5 CLI
-surface is being built:
+Generation is greedy and streams through DiskMule's own Metal runtime by
+default on macOS. Other platforms and `DISKMULE_BACKEND=cpu` use the explicit
+CPU correctness fallback. `DISKMULE_EXPERT_SLOTS` forces routed experts through
+that many storage-backed slots per layer; leaving it unset uses the retained
+GGUF mapping. Temporary development controls bound generation while the richer
+Phase 5 CLI surface is being built:
 
 ```bash
 DISKMULE_CONTEXT=4096 DISKMULE_MAX_TOKENS=64 diskmule run gemma4:26b
+DISKMULE_BACKEND=cpu diskmule run gemma4:26b
+DISKMULE_EXPERT_SLOTS=4 diskmule run gemma4:26b
 ```
 
 Remove a DiskMule-owned model:
@@ -146,6 +151,13 @@ softcapping, greedy selection, KV reuse, cancellation checks, and phase timing.
 A syntactically valid file using an unimplemented architecture or tensor type
 is reported as unsupported rather than being presented as runnable.
 
+On macOS, the Metal backend implements the same encodings and Gemma operations
+with a retained no-copy view of the GGUF mapping. Its KV cache is resident and
+sliding layers use window-bounded ring buffers. Routed experts can use either
+the mapped model or a deterministic per-layer LRU whose reusable aligned slots
+are filled by bounded parallel positional reads. Placement does not change
+precision or model semantics.
+
 ## Verification
 
 Run the complete local gate with:
@@ -165,6 +177,7 @@ The expensive pinned correctness oracle is separate from the fast gate:
 
 ```bash
 cargo test --release --test gemma4_cpu_reference -- --ignored --nocapture
+cargo test --release --test gemma4_metal_reference -- --ignored --nocapture
 ```
 
 For GGUF digest
@@ -172,4 +185,7 @@ For GGUF digest
 compares DiskMule with a temperature-zero Ollama 0.32.14 run. The four generated
 token IDs match exactly (`47610, 1852, 2624, 1852`), and the first token's
 normalized log probability differs by about 0.00131 under the documented 0.02
-tolerance.
+tolerance. The Metal oracle additionally compares every logit with the CPU
+reference under a 0.001 tolerance and forces the real model through a one-slot
+expert cache. Conditions and local M4 Max results are retained in
+[`benchmarks/2026-08-18-gemma4-m4-max.md`](benchmarks/2026-08-18-gemma4-m4-max.md).

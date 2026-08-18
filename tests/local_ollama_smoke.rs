@@ -213,6 +213,9 @@ fn installed_gemma_is_listed_inspected_and_protected() {
     assert!(inspection.contains("Architecture: gemma4"));
     assert!(inspection.contains("Quantization: Q4_K_M"));
     assert!(inspection.contains("GGUF version: 3"));
+    #[cfg(target_os = "macos")]
+    assert!(inspection.contains("DiskMule Metal chat"));
+    #[cfg(not(target_os = "macos"))]
     assert!(inspection.contains("DiskMule CPU chat"));
     assert!(inspection.ends_with(">>> "));
 
