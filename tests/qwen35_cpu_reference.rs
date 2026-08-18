@@ -1,6 +1,11 @@
 use std::{fs, path::Path};
 
-use diskmule::{cpu::argmax, gemma4::cpu::CancellationFlag, qwen35::cpu::Qwen35CpuModel};
+use diskmule::{
+    cpu::argmax,
+    gemma4::cpu::CancellationFlag,
+    qwen35::cpu::Qwen35CpuModel,
+    runtime::{BackendSelection, GenerationEngine, GenerationOptions},
+};
 use tempfile::TempDir;
 
 #[test]
@@ -23,6 +28,35 @@ fn mapped_hybrid_graph_generates_deterministically() {
     assert!(generated.stopped);
     assert_eq!(generated.profile.prompt_tokens, 2);
     assert_eq!(generated.profile.generated_tokens, 1);
+}
+
+#[test]
+fn shared_generation_engine_loads_and_runs_qwen35() {
+    let fixture = TinyQwen::write();
+    let engine = GenerationEngine::open(
+        "tiny-qwen",
+        &fixture.path,
+        "qwen35",
+        16,
+        BackendSelection::Cpu,
+    )
+    .unwrap();
+    let result = engine
+        .generate_tokens(
+            &[0, 1],
+            GenerationOptions {
+                maximum_new_tokens: 3,
+                ..GenerationOptions::default()
+            },
+            &CancellationFlag::default(),
+            |_, _| {},
+        )
+        .unwrap();
+
+    assert_eq!(engine.name(), "tiny-qwen");
+    assert_eq!(engine.backend(), BackendSelection::Cpu);
+    assert_eq!(result.token_ids, [4]);
+    assert_eq!(result.text, "e");
 }
 
 #[test]

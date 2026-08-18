@@ -15,7 +15,7 @@ use tokio::sync::mpsc as async_mpsc;
 use crate::{
     config::Paths,
     gemma4::{
-        ChatMessage, Gemma4Tokenizer,
+        ChatMessage,
         cpu::{
             CancellationFlag, Gemma4CpuModel, Gemma4CpuSession, GenerationProfile,
             GenerationResult, RuntimeError,
@@ -27,6 +27,10 @@ use crate::{
         tokenizer::render_chat as render_glm52_chat,
     },
     model::{ModelCatalog, ModelError},
+    qwen35::{
+        cpu::{Qwen35CpuModel, Qwen35CpuSession},
+        tokenizer::render_chat as render_qwen35_chat,
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -320,6 +324,7 @@ pub struct GenerationEngine {
 enum ArchitectureModel {
     Gemma4Cpu(Box<Gemma4CpuModel>),
     Glm52Cpu(Box<Glm52CpuModel>),
+    Qwen35(Box<Qwen35CpuModel>),
     #[cfg(target_os = "macos")]
     Gemma4Metal(Box<Gemma4MetalModel>),
 }
@@ -327,6 +332,7 @@ enum ArchitectureModel {
 enum ArchitectureSession {
     Gemma4Cpu(Gemma4CpuSession),
     Glm52Cpu(Glm52CpuSession),
+    Qwen35(Qwen35CpuSession),
     #[cfg(target_os = "macos")]
     Gemma4Metal(Gemma4MetalSession),
 }
@@ -347,6 +353,7 @@ impl GenerationEngine {
         match architecture {
             "gemma4" => Self::open_gemma4(name, path, context, backend),
             "glm_moe_dsa" => Self::open_glm52(name, path, context, backend),
+            "qwen35" => Self::open_qwen35(name, path, context, backend),
             other => Err(RuntimeError::InvalidConfiguration(format!(
                 "unsupported architecture {other:?}"
             ))),
@@ -374,6 +381,31 @@ impl GenerationEngine {
             path,
             backend,
             model,
+        })
+    }
+
+    pub fn open_qwen35(
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        context: usize,
+        backend: BackendSelection,
+    ) -> Result<Self, RuntimeError> {
+        let path = path.as_ref().to_path_buf();
+        let model = match backend {
+            BackendSelection::Cpu => Qwen35CpuModel::open(&path, context)?,
+            #[cfg(target_os = "macos")]
+            BackendSelection::Metal { .. } => Qwen35CpuModel::open_metal(&path, context)?,
+        };
+        tracing::info!(
+            model = %path.display(),
+            backend = %model.backend_label(),
+            "loaded Qwen3.5 architecture"
+        );
+        Ok(Self {
+            name: name.into(),
+            path,
+            backend,
+            model: ArchitectureModel::Qwen35(Box::new(model)),
         })
     }
 
@@ -417,12 +449,21 @@ impl GenerationEngine {
         self.backend
     }
 
-    fn gemma4_tokenizer(&self) -> Option<&Gemma4Tokenizer> {
+    fn tokenize_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>, RuntimeError> {
         match &self.model {
-            ArchitectureModel::Gemma4Cpu(model) => Some(&model.tokenizer),
-            ArchitectureModel::Glm52Cpu(_) => None,
+            ArchitectureModel::Gemma4Cpu(model) => {
+                Ok(model.tokenizer.encode(&render_chat(messages)?, false))
+            }
+            ArchitectureModel::Glm52Cpu(model) => Ok(model
+                .tokenizer
+                .encode(&render_glm52_chat(messages, false))?),
+            ArchitectureModel::Qwen35(model) => Ok(model
+                .tokenizer
+                .encode(&render_qwen35_chat(messages, false)?)?),
             #[cfg(target_os = "macos")]
-            ArchitectureModel::Gemma4Metal(model) => Some(&model.tokenizer),
+            ArchitectureModel::Gemma4Metal(model) => {
+                Ok(model.tokenizer.encode(&render_chat(messages)?, false))
+            }
         }
     }
 
@@ -437,17 +478,7 @@ impl GenerationEngine {
         F: FnMut(u32, &str),
     {
         let options = options.validate()?;
-        let tokens = match &self.model {
-            ArchitectureModel::Glm52Cpu(model) => model
-                .tokenizer
-                .encode(&render_glm52_chat(messages, false))?,
-            _ => {
-                let rendered = render_chat(messages)?;
-                self.gemma4_tokenizer()
-                    .expect("Gemma architecture has a Gemma tokenizer")
-                    .encode(&rendered, false)
-            }
-        };
+        let tokens = self.tokenize_chat(messages)?;
         self.generate_tokens(&tokens, options, cancellation, on_token)
     }
 
@@ -483,6 +514,17 @@ impl GenerationEngine {
                     on_token,
                 )
             }
+            ArchitectureModel::Qwen35(model) => {
+                let mut session = model.new_session();
+                model.generate_session_with_selector(
+                    &mut session,
+                    prompt_tokens,
+                    options.maximum_new_tokens,
+                    cancellation,
+                    |logits| sampler.select(logits),
+                    on_token,
+                )
+            }
             #[cfg(target_os = "macos")]
             ArchitectureModel::Gemma4Metal(model) => model.generate_with_selector(
                 prompt_tokens,
@@ -501,6 +543,9 @@ impl GenerationEngine {
             }
             ArchitectureModel::Glm52Cpu(model) => {
                 Ok(ArchitectureSession::Glm52Cpu(model.new_session()))
+            }
+            ArchitectureModel::Qwen35(model) => {
+                Ok(ArchitectureSession::Qwen35(model.new_session()))
             }
             #[cfg(target_os = "macos")]
             ArchitectureModel::Gemma4Metal(model) => {
@@ -521,17 +566,7 @@ impl GenerationEngine {
         F: FnMut(u32, &str),
     {
         let options = options.validate()?;
-        let tokens = match &self.model {
-            ArchitectureModel::Glm52Cpu(model) => model
-                .tokenizer
-                .encode(&render_glm52_chat(messages, false))?,
-            _ => {
-                let rendered = render_chat(messages)?;
-                self.gemma4_tokenizer()
-                    .expect("Gemma architecture has a Gemma tokenizer")
-                    .encode(&rendered, false)
-            }
-        };
+        let tokens = self.tokenize_chat(messages)?;
         let mut sampler = Sampler::new(options.sampling)?;
         match (&self.model, session) {
             (ArchitectureModel::Gemma4Cpu(model), ArchitectureSession::Gemma4Cpu(session)) => model
@@ -554,6 +589,15 @@ impl GenerationEngine {
                     on_token,
                 )
             }
+            (ArchitectureModel::Qwen35(model), ArchitectureSession::Qwen35(session)) => model
+                .generate_session_with_selector(
+                    session,
+                    &tokens,
+                    options.maximum_new_tokens,
+                    cancellation,
+                    |logits| sampler.select(logits),
+                    on_token,
+                ),
             #[cfg(target_os = "macos")]
             (ArchitectureModel::Gemma4Metal(model), ArchitectureSession::Gemma4Metal(session)) => {
                 model.generate_session_with_selector(
@@ -981,7 +1025,7 @@ impl RuntimeService {
             .architecture
             .clone()
             .unwrap_or_else(|| "unknown".to_owned());
-        if !matches!(architecture.as_str(), "gemma4" | "glm_moe_dsa") {
+        if !matches!(architecture.as_str(), "gemma4" | "glm_moe_dsa" | "qwen35") {
             return Err(ServiceError::UnsupportedArchitecture {
                 name: record.name,
                 architecture,

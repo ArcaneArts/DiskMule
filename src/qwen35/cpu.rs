@@ -225,6 +225,7 @@ impl Qwen35CpuModel {
         profile.prefill_time = prefill_started.elapsed();
 
         let mut generated = Vec::with_capacity(maximum_new_tokens);
+        let mut pending_utf8 = Vec::new();
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
@@ -242,10 +243,13 @@ impl Qwen35CpuModel {
                 stopped = true;
                 break;
             }
-            let piece = self.tokenizer.decode(&[next], false)?;
-            on_token(next, &piece);
             generated.push(next);
             profile.generated_tokens += 1;
+            pending_utf8.extend(self.tokenizer.decode_token_bytes(next, false)?);
+            let piece = drain_valid_utf8(&mut pending_utf8, false);
+            if !piece.is_empty() {
+                on_token(next, &piece);
+            }
             if generation_index + 1 < maximum_new_tokens {
                 let decode_started = Instant::now();
                 logits = self
@@ -261,6 +265,15 @@ impl Qwen35CpuModel {
                 session.tokens.push(next);
                 session.logits = Some(logits.clone());
                 profile.decode_time += decode_started.elapsed();
+            }
+        }
+        if !pending_utf8.is_empty() {
+            let piece = drain_valid_utf8(&mut pending_utf8, true);
+            if !piece.is_empty() {
+                on_token(
+                    *generated.last().expect("pending bytes have a token"),
+                    &piece,
+                );
             }
         }
         profile.resident_kv_bytes = session.state.resident_bytes();
@@ -758,6 +771,29 @@ impl Qwen35CpuModel {
     }
 }
 
+fn drain_valid_utf8(bytes: &mut Vec<u8>, final_piece: bool) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            let output = text.to_owned();
+            bytes.clear();
+            output
+        }
+        Err(error) if error.valid_up_to() > 0 => {
+            let valid = error.valid_up_to();
+            let output = String::from_utf8(bytes[..valid].to_vec())
+                .expect("UTF-8 validator identified a valid prefix");
+            bytes.drain(..valid);
+            output
+        }
+        Err(_) if final_piece => {
+            let output = String::from_utf8_lossy(bytes).into_owned();
+            bytes.clear();
+            output
+        }
+        Err(_) => String::new(),
+    }
+}
+
 impl Qwen35CpuSession {
     pub fn clear(&mut self) {
         self.state.clear();
@@ -975,7 +1011,9 @@ fn common_prefix_length(left: &[u32], right: &[u32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{GatedDeltaInput, gated_delta_update, partial_rope_neox_in_place};
+    use super::{
+        GatedDeltaInput, drain_valid_utf8, gated_delta_update, partial_rope_neox_in_place,
+    };
 
     #[test]
     fn gated_delta_rule_decays_updates_then_queries_state() {
@@ -1037,6 +1075,15 @@ mod tests {
             ],
             2e-5,
         );
+    }
+
+    #[test]
+    fn streaming_waits_for_complete_utf8_sequences() {
+        let mut bytes = vec![0xe4, 0xb8];
+        assert_eq!(drain_valid_utf8(&mut bytes, false), "");
+        bytes.push(0x96);
+        assert_eq!(drain_valid_utf8(&mut bytes, false), "世");
+        assert!(bytes.is_empty());
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
