@@ -10,6 +10,7 @@ pub mod gguf;
 pub mod glm52;
 pub mod metal;
 pub mod model;
+pub mod qwen35;
 pub mod runtime;
 pub mod safetensors;
 pub mod server;

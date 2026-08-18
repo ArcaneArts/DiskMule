@@ -12,6 +12,7 @@ use crate::{
     config::Paths,
     gguf::GgufFile,
     glm52::{Glm52Config, Glm52Weights},
+    qwen35::{Qwen35Config, Qwen35Weights},
     safetensors::{SafeDtype, SafeTensorIndex},
 };
 
@@ -524,8 +525,14 @@ fn inspect_model(
             let quantization = gguf.file_type().map(quantization_name);
             let compatibility = match architecture.as_deref() {
                 Some("gemma4") => Compatibility::MetadataCompatible,
+                Some("qwen35") => match Qwen35Config::from_gguf(&gguf)
+                    .and_then(|config| Qwen35Weights::from_gguf(&gguf, &config))
+                {
+                    Ok(_) => Compatibility::MetadataCompatible,
+                    Err(error) => Compatibility::Invalid(error.to_string()),
+                },
                 Some(other) => Compatibility::Unsupported(format!(
-                    "architecture {other}; the first pass supports gemma4 metadata"
+                    "architecture {other}; supported metadata: gemma4, qwen35"
                 )),
                 None => Compatibility::Invalid("missing general.architecture".to_owned()),
             };
