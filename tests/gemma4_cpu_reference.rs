@@ -23,7 +23,7 @@ struct Layer {
 /// exact model digest above, raw `<bos>`, temperature zero, and one output.
 #[test]
 #[ignore = "requires the installed 17 GB gemma4:26b and a full CPU forward pass"]
-fn greedy_first_token_matches_the_local_ollama_reference() {
+fn greedy_kv_decode_matches_the_local_ollama_reference() {
     let Some(root) = ollama_root() else {
         eprintln!("skipping: Ollama model root is unavailable");
         return;
@@ -48,15 +48,17 @@ fn greedy_first_token_matches_the_local_ollama_reference() {
     let result = model
         .generate_greedy(
             &[model.tokenizer.bos_id],
-            1,
+            4,
             &CancellationFlag::default(),
             |_, _| {},
         )
         .unwrap();
     eprintln!("DiskMule token IDs: {:?}", result.token_ids);
     eprintln!("DiskMule profile: {:#?}", result.profile);
-    assert_eq!(result.token_ids, [47_610]);
-    assert_eq!(result.text.trim_start(), "hedron");
+    assert_eq!(result.token_ids, [47_610, 1_852, 2_624, 1_852]);
+    assert_eq!(result.text.trim_start(), "hedron ownley own");
+    assert_eq!(result.profile.prompt_tokens, 1);
+    assert_eq!(result.profile.generated_tokens, 4);
 }
 
 fn ollama_root() -> Option<PathBuf> {
