@@ -38,6 +38,9 @@ pub enum AppError {
     #[error(transparent)]
     Runtime(#[from] crate::runtime::ServiceError),
 
+    #[error(transparent)]
+    SafeTensors(#[from] crate::safetensors::SafeTensorError),
+
     #[error("generation failed: {0}")]
     GenerationFailed(String),
 }
@@ -56,6 +59,7 @@ impl AppError {
             Self::Server(_) => ExitCode::FAILURE,
             Self::Gemma4(_) => ExitCode::FAILURE,
             Self::Runtime(_) => ExitCode::FAILURE,
+            Self::SafeTensors(_) => ExitCode::FAILURE,
             Self::GenerationFailed(_) => ExitCode::FAILURE,
         }
     }
