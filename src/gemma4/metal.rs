@@ -228,6 +228,7 @@ impl Gemma4MetalModel {
             resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
+        let prefill_started = Instant::now();
         let mut logits = self.prefill(
             prompt_tokens,
             &mut cache,
@@ -235,11 +236,15 @@ impl Gemma4MetalModel {
             cancellation,
             &mut profile,
         )?;
+        profile.prefill_time = prefill_started.elapsed();
         let mut generated = Vec::with_capacity(maximum_new_tokens);
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
             let next = self.metal.argmax(&logits)? as u32;
+            if generation_index == 0 {
+                profile.time_to_first_token = started.elapsed();
+            }
             if self.tokenizer.stop_token_ids.contains(&next) {
                 stopped = true;
                 break;
@@ -249,6 +254,7 @@ impl Gemma4MetalModel {
             generated.push(next);
             profile.generated_tokens += 1;
             if generation_index + 1 < maximum_new_tokens {
+                let decode_started = Instant::now();
                 logits = self
                     .forward_token(
                         next,
@@ -260,6 +266,7 @@ impl Gemma4MetalModel {
                         &mut profile,
                     )?
                     .expect("decode requests logits");
+                profile.decode_time += decode_started.elapsed();
             }
         }
         record_expert_stats(&mut profile, expert_cache.as_ref().map(ExpertCache::stats));
@@ -295,6 +302,7 @@ impl Gemma4MetalModel {
             resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
+        let prefill_started = Instant::now();
         let logits = self.prefill(
             prompt_tokens,
             &mut cache,
@@ -302,6 +310,7 @@ impl Gemma4MetalModel {
             cancellation,
             &mut profile,
         )?;
+        profile.prefill_time = prefill_started.elapsed();
         record_expert_stats(&mut profile, expert_cache.as_ref().map(ExpertCache::stats));
         profile.total_time = started.elapsed();
         Ok((logits, profile))

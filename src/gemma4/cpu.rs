@@ -111,6 +111,9 @@ pub struct GenerationProfile {
     pub expert_bytes_read: u64,
     pub expert_io_wait: Duration,
     pub expert_resident_bytes: u64,
+    pub time_to_first_token: Duration,
+    pub prefill_time: Duration,
+    pub decode_time: Duration,
     pub embedding_time: Duration,
     pub attention_time: Duration,
     pub feed_forward_time: Duration,
@@ -212,13 +215,18 @@ impl Gemma4CpuModel {
             prompt_tokens: prompt_tokens.len(),
             ..GenerationProfile::default()
         };
+        let prefill_started = Instant::now();
         let mut logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
+        profile.prefill_time = prefill_started.elapsed();
 
         let mut generated = Vec::with_capacity(maximum_new_tokens);
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
             let next = argmax(&logits)? as u32;
+            if generation_index == 0 {
+                profile.time_to_first_token = started.elapsed();
+            }
             if self.tokenizer.stop_token_ids.contains(&next) {
                 stopped = true;
                 break;
@@ -228,6 +236,7 @@ impl Gemma4CpuModel {
             generated.push(next);
             profile.generated_tokens += 1;
             if generation_index + 1 < maximum_new_tokens {
+                let decode_started = Instant::now();
                 logits = self
                     .forward_token(
                         next,
@@ -238,6 +247,7 @@ impl Gemma4CpuModel {
                         &mut profile,
                     )?
                     .expect("decode requests logits");
+                profile.decode_time += decode_started.elapsed();
             }
         }
         profile.total_time = started.elapsed();
@@ -271,7 +281,9 @@ impl Gemma4CpuModel {
             prompt_tokens: prompt_tokens.len(),
             ..GenerationProfile::default()
         };
+        let prefill_started = Instant::now();
         let logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
+        profile.prefill_time = prefill_started.elapsed();
         profile.total_time = started.elapsed();
         Ok((logits, profile))
     }
