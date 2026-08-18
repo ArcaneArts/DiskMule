@@ -7,6 +7,7 @@ pub mod error;
 pub mod expert;
 pub mod gemma4;
 pub mod gguf;
+pub mod glm52;
 pub mod metal;
 pub mod model;
 pub mod runtime;
