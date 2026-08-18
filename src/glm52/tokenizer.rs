@@ -310,6 +310,39 @@ impl Glm52Tokenizer {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    pub fn decode_token_bytes(
+        &self,
+        id: u32,
+        include_special: bool,
+    ) -> Result<Vec<u8>, Glm52TokenizerError> {
+        let token = self
+            .decoded
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Glm52TokenizerError::InvalidTokenId { id })?;
+        if token.added {
+            return Ok(if include_special || !token.special {
+                token.text.as_bytes().to_vec()
+            } else {
+                Vec::new()
+            });
+        }
+        token
+            .text
+            .chars()
+            .map(|character| {
+                self.char_to_byte
+                    .get(&character)
+                    .copied()
+                    .ok_or_else(|| Glm52TokenizerError::UnknownSymbol(character.to_string()))
+            })
+            .collect()
+    }
+
+    pub fn vocabulary_size(&self) -> usize {
+        self.decoded.len()
+    }
+
     pub fn token_id(&self, text: &str) -> Option<u32> {
         self.added
             .iter()

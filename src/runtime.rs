@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -15,8 +16,15 @@ use crate::{
     config::Paths,
     gemma4::{
         ChatMessage, Gemma4Tokenizer,
-        cpu::{CancellationFlag, Gemma4CpuModel, Gemma4CpuSession, GenerationResult, RuntimeError},
+        cpu::{
+            CancellationFlag, Gemma4CpuModel, Gemma4CpuSession, GenerationProfile,
+            GenerationResult, RuntimeError,
+        },
         render_chat,
+    },
+    glm52::{
+        cpu::{Glm52CpuModel, Glm52CpuSession},
+        tokenizer::render_chat as render_glm52_chat,
     },
     model::{ModelCatalog, ModelError},
 };
@@ -311,12 +319,14 @@ pub struct GenerationEngine {
 
 enum ArchitectureModel {
     Gemma4Cpu(Gemma4CpuModel),
+    Glm52Cpu(Glm52CpuModel),
     #[cfg(target_os = "macos")]
     Gemma4Metal(Gemma4MetalModel),
 }
 
 enum ArchitectureSession {
     Gemma4Cpu(Gemma4CpuSession),
+    Glm52Cpu(Glm52CpuSession),
     #[cfg(target_os = "macos")]
     Gemma4Metal(Gemma4MetalSession),
 }
@@ -327,6 +337,22 @@ struct ResidentSession {
 }
 
 impl GenerationEngine {
+    pub fn open(
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        architecture: &str,
+        context: usize,
+        backend: BackendSelection,
+    ) -> Result<Self, RuntimeError> {
+        match architecture {
+            "gemma4" => Self::open_gemma4(name, path, context, backend),
+            "glm_moe_dsa" => Self::open_glm52(name, path, context, backend),
+            other => Err(RuntimeError::InvalidConfiguration(format!(
+                "unsupported architecture {other:?}"
+            ))),
+        }
+    }
+
     pub fn open_gemma4(
         name: impl Into<String>,
         path: impl AsRef<Path>,
@@ -351,6 +377,25 @@ impl GenerationEngine {
         })
     }
 
+    pub fn open_glm52(
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        context: usize,
+        requested_backend: BackendSelection,
+    ) -> Result<Self, RuntimeError> {
+        if requested_backend != BackendSelection::Cpu {
+            tracing::warn!("GLM-5.2 Metal is not active yet; using the CPU correctness backend");
+        }
+        let path = path.as_ref().to_path_buf();
+        let model = Glm52CpuModel::from_directory_with_context(&path, context)?;
+        Ok(Self {
+            name: name.into(),
+            path,
+            backend: BackendSelection::Cpu,
+            model: ArchitectureModel::Glm52Cpu(model),
+        })
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -363,11 +408,12 @@ impl GenerationEngine {
         self.backend
     }
 
-    pub fn tokenizer(&self) -> &Gemma4Tokenizer {
+    fn gemma4_tokenizer(&self) -> Option<&Gemma4Tokenizer> {
         match &self.model {
-            ArchitectureModel::Gemma4Cpu(model) => &model.tokenizer,
+            ArchitectureModel::Gemma4Cpu(model) => Some(&model.tokenizer),
+            ArchitectureModel::Glm52Cpu(_) => None,
             #[cfg(target_os = "macos")]
-            ArchitectureModel::Gemma4Metal(model) => &model.tokenizer,
+            ArchitectureModel::Gemma4Metal(model) => Some(&model.tokenizer),
         }
     }
 
@@ -382,8 +428,17 @@ impl GenerationEngine {
         F: FnMut(u32, &str),
     {
         let options = options.validate()?;
-        let rendered = render_chat(messages)?;
-        let tokens = self.tokenizer().encode(&rendered, false);
+        let tokens = match &self.model {
+            ArchitectureModel::Glm52Cpu(model) => model
+                .tokenizer
+                .encode(&render_glm52_chat(messages, false))?,
+            _ => {
+                let rendered = render_chat(messages)?;
+                self.gemma4_tokenizer()
+                    .expect("Gemma architecture has a Gemma tokenizer")
+                    .encode(&rendered, false)
+            }
+        };
         self.generate_tokens(&tokens, options, cancellation, on_token)
     }
 
@@ -407,6 +462,18 @@ impl GenerationEngine {
                 |logits| sampler.select(logits),
                 on_token,
             ),
+            ArchitectureModel::Glm52Cpu(model) => {
+                let mut session = model.new_session();
+                generate_glm52_session(
+                    model,
+                    &mut session,
+                    prompt_tokens,
+                    options,
+                    cancellation,
+                    &mut sampler,
+                    on_token,
+                )
+            }
             #[cfg(target_os = "macos")]
             ArchitectureModel::Gemma4Metal(model) => model.generate_with_selector(
                 prompt_tokens,
@@ -422,6 +489,9 @@ impl GenerationEngine {
         match &self.model {
             ArchitectureModel::Gemma4Cpu(model) => {
                 Ok(ArchitectureSession::Gemma4Cpu(model.new_session()))
+            }
+            ArchitectureModel::Glm52Cpu(model) => {
+                Ok(ArchitectureSession::Glm52Cpu(model.new_session()))
             }
             #[cfg(target_os = "macos")]
             ArchitectureModel::Gemma4Metal(model) => {
@@ -442,8 +512,17 @@ impl GenerationEngine {
         F: FnMut(u32, &str),
     {
         let options = options.validate()?;
-        let rendered = render_chat(messages)?;
-        let tokens = self.tokenizer().encode(&rendered, false);
+        let tokens = match &self.model {
+            ArchitectureModel::Glm52Cpu(model) => model
+                .tokenizer
+                .encode(&render_glm52_chat(messages, false))?,
+            _ => {
+                let rendered = render_chat(messages)?;
+                self.gemma4_tokenizer()
+                    .expect("Gemma architecture has a Gemma tokenizer")
+                    .encode(&rendered, false)
+            }
+        };
         let mut sampler = Sampler::new(options.sampling)?;
         match (&self.model, session) {
             (ArchitectureModel::Gemma4Cpu(model), ArchitectureSession::Gemma4Cpu(session)) => model
@@ -455,6 +534,17 @@ impl GenerationEngine {
                     |logits| sampler.select(logits),
                     on_token,
                 ),
+            (ArchitectureModel::Glm52Cpu(model), ArchitectureSession::Glm52Cpu(session)) => {
+                generate_glm52_session(
+                    model,
+                    session,
+                    &tokens,
+                    options,
+                    cancellation,
+                    &mut sampler,
+                    on_token,
+                )
+            }
             #[cfg(target_os = "macos")]
             (ArchitectureModel::Gemma4Metal(model), ArchitectureSession::Gemma4Metal(session)) => {
                 model.generate_session_with_selector(
@@ -471,6 +561,159 @@ impl GenerationEngine {
                 "session architecture does not match its loaded model".to_owned(),
             )),
         }
+    }
+}
+
+fn generate_glm52_session<F>(
+    model: &Glm52CpuModel,
+    session: &mut Glm52CpuSession,
+    prompt_tokens: &[u32],
+    options: GenerationOptions,
+    cancellation: &CancellationFlag,
+    sampler: &mut Sampler,
+    mut on_token: F,
+) -> Result<GenerationResult, RuntimeError>
+where
+    F: FnMut(u32, &str),
+{
+    if prompt_tokens.is_empty() {
+        return Err(RuntimeError::EmptyPrompt);
+    }
+    let requested = prompt_tokens
+        .len()
+        .checked_add(options.maximum_new_tokens)
+        .ok_or(RuntimeError::ContextLimit {
+            requested: usize::MAX,
+            limit: session.maximum_context(),
+        })?;
+    if requested > session.maximum_context() {
+        return Err(RuntimeError::ContextLimit {
+            requested,
+            limit: session.maximum_context(),
+        });
+    }
+
+    let reusable = session
+        .tokens
+        .iter()
+        .zip(prompt_tokens)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let stable_logits = (reusable == session.tokens.len())
+        .then(|| session.logits.clone())
+        .flatten();
+    session.truncate(reusable);
+    session.logits = stable_logits.clone();
+
+    let result = (|| {
+        let started = Instant::now();
+        let mut profile = GenerationProfile {
+            prompt_tokens: prompt_tokens.len(),
+            reused_prompt_tokens: reusable,
+            ..GenerationProfile::default()
+        };
+        let prefill_started = Instant::now();
+        let mut logits = if reusable == prompt_tokens.len() {
+            session.logits.clone().ok_or_else(|| {
+                RuntimeError::InvalidConfiguration(
+                    "GLM session is missing logits for its cached prompt".to_owned(),
+                )
+            })?
+        } else {
+            let mut final_logits = None;
+            for token in prompt_tokens.iter().copied().skip(reusable) {
+                if cancellation.is_cancelled() {
+                    return Err(RuntimeError::Cancelled);
+                }
+                let output = model.forward_token(session, token, cancellation.as_atomic())?;
+                session.tokens.push(token);
+                session.logits = Some(output.clone());
+                final_logits = Some(output);
+            }
+            final_logits.expect("non-empty GLM prompt suffix produces logits")
+        };
+        profile.prefill_time = prefill_started.elapsed();
+
+        let mut generated = Vec::with_capacity(options.maximum_new_tokens);
+        let mut pending_utf8 = Vec::new();
+        let mut stopped = false;
+        for generation_index in 0..options.maximum_new_tokens {
+            if cancellation.is_cancelled() {
+                return Err(RuntimeError::Cancelled);
+            }
+            let next = sampler.select(&logits)?;
+            if next as usize >= logits.len() {
+                return Err(RuntimeError::InvalidToken {
+                    token: next,
+                    vocabulary: logits.len(),
+                });
+            }
+            if generation_index == 0 {
+                profile.time_to_first_token = started.elapsed();
+            }
+            if model.config.stop_token_ids.contains(&next) || model.tokenizer.is_special(next) {
+                stopped = true;
+                break;
+            }
+            generated.push(next);
+            profile.generated_tokens += 1;
+            pending_utf8.extend(model.tokenizer.decode_token_bytes(next, false)?);
+            let piece = drain_valid_utf8(&mut pending_utf8, false);
+            if !piece.is_empty() {
+                on_token(next, &piece);
+            }
+            if generation_index + 1 < options.maximum_new_tokens {
+                let decode_started = Instant::now();
+                logits = model.forward_token(session, next, cancellation.as_atomic())?;
+                session.tokens.push(next);
+                session.logits = Some(logits.clone());
+                profile.decode_time += decode_started.elapsed();
+            }
+        }
+        if !pending_utf8.is_empty() {
+            let piece = drain_valid_utf8(&mut pending_utf8, true);
+            if !piece.is_empty() {
+                on_token(
+                    *generated.last().expect("pending bytes have a token"),
+                    &piece,
+                );
+            }
+        }
+        profile.total_time = started.elapsed();
+        Ok(GenerationResult {
+            text: model.tokenizer.decode(&generated, false)?,
+            token_ids: generated,
+            stopped,
+            profile,
+        })
+    })();
+    if result.is_err() {
+        session.truncate(reusable);
+        session.logits = stable_logits;
+    }
+    result
+}
+
+fn drain_valid_utf8(bytes: &mut Vec<u8>, final_piece: bool) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            let output = text.to_owned();
+            bytes.clear();
+            output
+        }
+        Err(error) if error.valid_up_to() > 0 => {
+            let valid = error.valid_up_to();
+            let output = String::from_utf8(bytes[..valid].to_vec())
+                .expect("UTF-8 validator identified a valid prefix");
+            bytes.drain(..valid);
+            output
+        }
+        Err(_) if final_piece => {
+            let output = String::from_utf8_lossy(bytes).into_owned();
+            bytes.clear();
+            output
+        }
+        Err(_) => String::new(),
     }
 }
 
@@ -697,7 +940,7 @@ impl RuntimeService {
             .architecture
             .clone()
             .unwrap_or_else(|| "unknown".to_owned());
-        if architecture != "gemma4" {
+        if !matches!(architecture.as_str(), "gemma4" | "glm_moe_dsa") {
             return Err(ServiceError::UnsupportedArchitecture {
                 name: record.name,
                 architecture,
@@ -762,10 +1005,22 @@ fn spawn_model_worker(
     let status = Arc::new(Mutex::new(WorkerStatus::Loading));
     let worker_status = Arc::clone(&status);
     let worker_name = name.clone();
+    let load_architecture = architecture.clone();
+    let backend_label = if architecture == "glm_moe_dsa" {
+        "CPU (GLM correctness backend)".to_owned()
+    } else {
+        backend.label()
+    };
     let thread = thread::Builder::new()
         .name("diskmule-model".to_owned())
         .spawn(move || {
-            let engine = GenerationEngine::open_gemma4(worker_name, path, limits.context, backend);
+            let engine = GenerationEngine::open(
+                worker_name,
+                path,
+                &load_architecture,
+                limits.context,
+                backend,
+            );
             match engine {
                 Ok(engine) => {
                     *lock_unpoisoned(&worker_status) = WorkerStatus::Ready;
@@ -796,7 +1051,7 @@ fn spawn_model_worker(
     Ok(ModelWorker {
         name,
         architecture,
-        backend: backend.label(),
+        backend: backend_label,
         sender,
         status,
         thread: Some(thread),
@@ -885,7 +1140,7 @@ fn run_model_worker(
                     .blocking_send(GenerationEvent::Complete(Box::new(result)));
             }
             Err(error) => {
-                let cancelled = matches!(error, RuntimeError::Cancelled);
+                let cancelled = error.is_cancelled();
                 let _ = job.events.blocking_send(GenerationEvent::Error {
                     message: error.to_string(),
                     cancelled,
@@ -1068,9 +1323,17 @@ fn expert_residency_from_environment() -> Result<ExpertResidency, RuntimeError> 
 mod tests {
     use tokio::sync::mpsc;
 
-    use crate::gemma4::cpu::CancellationFlag;
+    use tempfile::TempDir;
 
-    use super::{GenerationOptions, GenerationTicket, RuntimeLimits, Sampler, SamplingConfig};
+    use crate::{
+        gemma4::{ChatMessage, ChatRole, cpu::CancellationFlag},
+        glm52::cpu::write_test_model,
+    };
+
+    use super::{
+        BackendSelection, GenerationEngine, GenerationOptions, GenerationTicket, RuntimeLimits,
+        Sampler, SamplingConfig,
+    };
 
     #[test]
     fn greedy_sampling_is_stable_and_uses_lowest_id_for_ties() {
@@ -1149,5 +1412,50 @@ mod tests {
             cancellation,
         });
         assert!(observed.is_cancelled());
+    }
+
+    #[test]
+    fn glm_uses_shared_sampling_and_persistent_prompt_sessions() {
+        let temp = TempDir::new().unwrap();
+        write_test_model(temp.path());
+        let engine = GenerationEngine::open(
+            "glm-tiny",
+            temp.path(),
+            "glm_moe_dsa",
+            32,
+            BackendSelection::Cpu,
+        )
+        .unwrap();
+        assert_eq!(engine.backend(), BackendSelection::Cpu);
+
+        let cancellation = CancellationFlag::default();
+        let direct = engine
+            .generate_tokens(
+                &[1],
+                GenerationOptions {
+                    maximum_new_tokens: 1,
+                    ..GenerationOptions::default()
+                },
+                &cancellation,
+                |_, _| {},
+            )
+            .unwrap();
+        assert_eq!(direct.token_ids, [5]);
+
+        let messages = [ChatMessage::new(ChatRole::User, "!")];
+        let options = GenerationOptions {
+            maximum_new_tokens: 1,
+            ..GenerationOptions::default()
+        };
+        let mut session = engine.new_session().unwrap();
+        let first = engine
+            .generate_chat_in_session(&mut session, &messages, options, &cancellation, |_, _| {})
+            .unwrap();
+        let second = engine
+            .generate_chat_in_session(&mut session, &messages, options, &cancellation, |_, _| {})
+            .unwrap();
+        assert_eq!(first.token_ids, second.token_ids);
+        assert_eq!(first.profile.reused_prompt_tokens, 0);
+        assert!(second.profile.reused_prompt_tokens > 0);
     }
 }

@@ -796,7 +796,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{Compatibility, ModelCatalog, ModelError, ModelSource};
-    use crate::config::Paths;
+    use crate::{config::Paths, glm52::cpu::write_test_model};
 
     #[test]
     fn discovers_managed_and_ollama_models_with_distinct_ownership() {
@@ -840,6 +840,23 @@ mod tests {
         assert_eq!(record.source, ModelSource::LocalFile);
         assert_eq!(record.path, Some(fs::canonicalize(local).unwrap()));
         assert_eq!(record.architecture.as_deref(), Some("gemma4"));
+        assert!(record.compatibility.is_metadata_compatible());
+    }
+
+    #[test]
+    fn resolves_a_direct_glm_snapshot_as_read_only() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::from_root(temp.path().join("diskmule"));
+        let local = temp.path().join("glm-tiny");
+        fs::create_dir(&local).unwrap();
+        write_test_model(&local);
+
+        let catalog = ModelCatalog::discover(&paths, None).unwrap();
+        let record = catalog.resolve_for_run(local.to_str().unwrap()).unwrap();
+        assert_eq!(record.source, ModelSource::LocalFile);
+        assert_eq!(record.path, Some(fs::canonicalize(local).unwrap()));
+        assert_eq!(record.architecture.as_deref(), Some("glm_moe_dsa"));
+        assert_eq!(record.safetensors.as_ref().unwrap().shard_count, 1);
         assert!(record.compatibility.is_metadata_compatible());
     }
 

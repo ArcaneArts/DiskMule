@@ -35,6 +35,12 @@ pub enum RuntimeError {
     #[error(transparent)]
     Cpu(#[from] cpu::CpuError),
 
+    #[error(transparent)]
+    Glm52Cpu(#[from] crate::glm52::cpu::Glm52CpuError),
+
+    #[error(transparent)]
+    Glm52Tokenizer(#[from] crate::glm52::tokenizer::Glm52TokenizerError),
+
     #[cfg(target_os = "macos")]
     #[error(transparent)]
     Metal(#[from] MetalError),
@@ -80,6 +86,16 @@ pub enum RuntimeError {
     },
 }
 
+impl RuntimeError {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+            || matches!(
+                self,
+                Self::Glm52Cpu(crate::glm52::cpu::Glm52CpuError::Cancelled)
+            )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CancellationFlag(Arc<AtomicBool>);
 
@@ -90,6 +106,10 @@ impl CancellationFlag {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn as_atomic(&self) -> &AtomicBool {
+        &self.0
     }
 
     pub(super) fn check(&self) -> Result<(), RuntimeError> {

@@ -9,6 +9,7 @@ use crate::{
     glm52::{
         Glm52Config, Glm52Error, Glm52FeedForwardWeights, Glm52IndexerWeights, Glm52LayerWeights,
         Glm52Weights, IndexerKind,
+        tokenizer::{Glm52Tokenizer, Glm52TokenizerError},
     },
     safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
 };
@@ -19,6 +20,9 @@ const FP8_BLOCK: usize = 128;
 pub enum Glm52CpuError {
     #[error(transparent)]
     Model(#[from] Glm52Error),
+
+    #[error(transparent)]
+    Tokenizer(#[from] Glm52TokenizerError),
 
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
@@ -91,8 +95,10 @@ pub enum Glm52CpuError {
 /// A loaded CPU model. Dense tensors remain on disk and are read by range as needed.
 pub struct Glm52CpuModel {
     pub config: Glm52Config,
+    pub tokenizer: Glm52Tokenizer,
     pub weights: Glm52Weights,
     source: SafeTensorSource,
+    max_context: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +106,9 @@ pub struct Glm52CpuSession {
     maximum_context: usize,
     layers: Vec<Glm52LayerCache>,
     dsa_selection: Option<Vec<usize>>,
+    dsa_history: Vec<Option<Vec<usize>>>,
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) logits: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,15 +120,41 @@ struct Glm52LayerCache {
 
 impl Glm52CpuModel {
     pub fn from_directory(directory: impl AsRef<Path>) -> Result<Self, Glm52CpuError> {
+        Self::from_directory_with_context(directory, 4_096)
+    }
+
+    pub fn from_directory_with_context(
+        directory: impl AsRef<Path>,
+        max_context: usize,
+    ) -> Result<Self, Glm52CpuError> {
         let directory = directory.as_ref();
         let config = Glm52Config::from_directory(directory)?;
+        if max_context == 0 {
+            return Err(Glm52CpuError::ContextExceeded { maximum: 0 });
+        }
+        let tokenizer = Glm52Tokenizer::from_directory(directory)?;
+        if tokenizer.vocabulary_size() != config.vocabulary_size {
+            return Err(Glm52CpuError::Tokenizer(Glm52TokenizerError::Unsupported(
+                format!(
+                    "tokenizer has {} IDs but config declares {}",
+                    tokenizer.vocabulary_size(),
+                    config.vocabulary_size
+                ),
+            )));
+        }
         let source = SafeTensorSource::open(directory)?;
         let weights = Glm52Weights::from_index(&source.index, &config)?;
         Ok(Self {
             config,
+            tokenizer,
             weights,
             source,
+            max_context,
         })
+    }
+
+    pub fn new_session(&self) -> Glm52CpuSession {
+        self.start_session(self.max_context)
     }
 
     pub fn start_session(&self, maximum_context: usize) -> Glm52CpuSession {
@@ -127,6 +162,9 @@ impl Glm52CpuModel {
             maximum_context,
             layers: vec![Glm52LayerCache::default(); self.config.layer_count],
             dsa_selection: None,
+            dsa_history: Vec::new(),
+            tokens: Vec::new(),
+            logits: None,
         }
     }
 
@@ -166,6 +204,7 @@ impl Glm52CpuModel {
                 layer.index_keys.truncate(position);
             }
             session.dsa_selection = previous_selection;
+            session.dsa_history.truncate(position);
         }
         result
     }
@@ -209,7 +248,9 @@ impl Glm52CpuModel {
         check_cancelled(cancelled)?;
         let final_norm = reader.vector(self.weights.output_norm)?;
         let normalized = rms_norm(&hidden, &final_norm, self.config.rms_epsilon);
-        reader.matvec(self.weights.output, &normalized)
+        let logits = reader.matvec(self.weights.output, &normalized)?;
+        session.dsa_history.push(session.dsa_selection.clone());
+        Ok(logits)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -467,6 +508,17 @@ impl Glm52CpuSession {
 
     pub const fn maximum_context(&self) -> usize {
         self.maximum_context
+    }
+
+    pub(crate) fn truncate(&mut self, length: usize) {
+        for layer in &mut self.layers {
+            layer.latent.truncate(length);
+            layer.rope.truncate(length);
+            layer.index_keys.truncate(length);
+        }
+        self.dsa_history.truncate(length);
+        self.dsa_selection = self.dsa_history.last().cloned().flatten();
+        self.tokens.truncate(length);
     }
 }
 
@@ -852,6 +904,11 @@ fn f16_to_f32(value: u16) -> f32 {
 }
 
 #[cfg(test)]
+pub(crate) fn write_test_model(directory: &Path) {
+    tests::write_tiny_model(directory);
+}
+
+#[cfg(test)]
 mod tests {
     use std::{fs, io::Write, path::Path, sync::atomic::AtomicBool};
 
@@ -1062,7 +1119,7 @@ mod tests {
             .0
     }
 
-    fn write_tiny_model(directory: &Path) {
+    pub(super) fn write_tiny_model(directory: &Path) {
         fs::write(
             directory.join("config.json"),
             serde_json::to_vec(&json!({
@@ -1093,6 +1150,40 @@ mod tests {
                 "rope_parameters": {"rope_theta": 10000.0},
                 "rms_norm_eps": 0.00001,
                 "eos_token_id": [2,3]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vocabulary = (0..8)
+            .map(|id| {
+                (
+                    char::from_u32(33 + id).unwrap().to_string(),
+                    serde_json::Value::from(id),
+                )
+            })
+            .collect::<Map<_, _>>();
+        let added_tokens = [
+            (8, "[gMASK]"),
+            (9, "<sop>"),
+            (10, "<|system|>"),
+            (11, "<|user|>"),
+            (12, "<|assistant|>"),
+            (13, "<think>"),
+            (14, "</think>"),
+            (15, "<|observation|>"),
+        ]
+        .map(|(id, content)| json!({"id": id, "content": content, "special": true}));
+        fs::write(
+            directory.join("tokenizer.json"),
+            serde_json::to_vec(&json!({
+                "model": {
+                    "type": "BPE",
+                    "vocab": vocabulary,
+                    "merges": [],
+                    "ignore_merges": true,
+                    "byte_fallback": false
+                },
+                "added_tokens": added_tokens
             }))
             .unwrap(),
         )
