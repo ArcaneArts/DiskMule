@@ -285,9 +285,10 @@ shutdown. CLI and both server modes produced the same configured greedy
 ### Phase 6: GLM-5.2 and genuine out-of-core operation
 
 Status: safe implementation complete for deterministic tiny CPU/Metal fixtures,
-including the recommended Colibri grouped-INT4 container; full-model validation
-and performance sweeps remain blocked on an authorized GLM-5.2 checkpoint
-acquisition with adequate storage headroom.
+including the recommended Colibri grouped-INT4 container. A complete
+user-supplied checkpoint is now available and has passed the payload-lazy real
+metadata/tensor-contract oracle; full-model inference and performance sweeps
+are in progress.
 
 - Add safetensors indexing and the GLM-5.2 architecture module.
 - Port only the GLM-specific semantics required for correct inference, using
@@ -354,6 +355,15 @@ without explicit authorization or a suitably sized external target. The exact
 acquisition and validation sequence is retained in
 `benchmarks/2026-08-18-glm52-acquisition-plan.md`.
 
+The user subsequently supplied the complete recommended checkpoint without a
+DiskMule-initiated download. Its 141 ordinary shards total exactly
+`419,296,541,560` bytes and the optional MTP shard is `9,959,321,520` bytes.
+The local small-file digests match the audited revision. A payload-lazy runtime
+oracle indexed all 142 shards and 118,478 unique tensors, then validated all 78
+ordinary layers, 75 sparse layers, 256 experts per sparse layer, grouped-INT4
+geometry, and the intentionally absent DSA sidecar. No model payload was copied
+or committed.
+
 ### Phase 7: broaden model support
 
 Status: complete on 2026-08-18 for the pinned local `qwen3.8:latest` Q4_K_M
@@ -408,10 +418,10 @@ the real graph and CLI/server worker paths.
 ## Current milestone
 
 All safe Phase 6 implementation work, including Colibri grouped-INT4 CPU,
-Metal, and streamed-expert execution, and Phase 7 are complete. The remaining
-goal blocker is the unavailable full GLM-5.2 checkpoint and the authorization
-required for its hundreds-of-gigabytes storage commitment, out-of-core oracle,
-and controlled performance sweep. These commands work:
+Metal, streamed-expert execution, real tokenizer verification, and full local
+checkpoint contract validation is complete, and Phase 7 is complete. The
+remaining goal work is the real GLM-5.2 ordinary-decode oracle, forced
+out-of-core parity, and controlled performance sweep. These commands work:
 
 ```text
 diskmule ls
@@ -426,6 +436,5 @@ on supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
 external deletion, and `--serve` provides bounded streaming and non-streaming
 chat. Qwen3.8 is verified through the same CLI and server. GLM fixture-backed
 safetensors, CPU, Metal, session, profiling, and storage-backed expert
-semantics are implemented. A full Phase 6 claim still requires the real
-out-of-core model and explicit authorization for any large download or disk
-commitment.
+semantics are implemented. A full Phase 6 claim still requires successful
+ordinary decoding and out-of-core evidence from the now-available real model.

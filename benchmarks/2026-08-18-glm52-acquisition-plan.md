@@ -82,6 +82,16 @@ as grouped INT4 merely because it also uses flat U8 storage.
 5. Download into a dedicated partial directory with resumable transfers, then
    verify every size before one atomic rename to the final snapshot directory.
 
+## Acquisition resolution
+
+The user supplied the complete recommended checkpoint independently; DiskMule
+did not initiate a download. The 141 ordinary shard sizes total exactly
+`419,296,541,560` bytes, the MTP shard is `9,959,321,520` bytes, and all four
+small-file digests match the audited revision above. The payload-lazy
+`glm52_reference` oracle indexes 142 shards and 118,478 unique tensors and
+accepts the complete ordinary-decode contract. The checkpoint remains outside
+the repository and is treated as read-only test data.
+
 ## Correctness sequence
 
 1. Run `diskmule ls` and open the snapshot metadata. This must index all shards

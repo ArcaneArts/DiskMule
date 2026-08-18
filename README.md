@@ -251,6 +251,8 @@ cargo test --release --test gemma4_metal_reference -- --ignored --nocapture
 cargo test --release --test gemma4_server_reference -- --ignored --nocapture
 DISKMULE_GLM52_METADATA=/path/to/glm-metadata \
   cargo test --test glm52_tokenizer_reference -- --ignored --nocapture
+DISKMULE_GLM52_SNAPSHOT=/path/to/glm-snapshot \
+  cargo test --test glm52_reference -- --ignored --nocapture
 cargo test --release --test qwen35_reference -- --ignored --nocapture
 cargo test --release --test qwen35_server_reference -- --ignored --nocapture
 ```
@@ -261,6 +263,11 @@ The GLM metadata oracle needs only `config.json`, `generation_config.json`,
 shards. It pins exact Hugging Face tokenizer IDs and validates the checkpoint's
 154,880-row padded model vocabulary against its 154,856 defined tokenizer IDs.
 Undefined padded output rows are excluded from sampling.
+
+The GLM snapshot oracle indexes all real shards, checks the exact audited
+tensor/dtype counts, and applies the complete ordinary-decode tensor contract
+without loading tensor payloads. It is intentionally separate from the routine
+gate because the checkpoint is about 400 GB.
 
 For GGUF digest
 `7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, it

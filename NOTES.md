@@ -216,15 +216,16 @@ default. `DISKMULE_GLM_DIRECT=1` applies `F_NOCACHE` to each safetensors shard
 descriptor on macOS for a controlled direct-versus-buffered experiment. No
 performance conclusion has been drawn from the tiny fixture.
 
-This closes safe implementation work but not Phase 6. There is no full GLM-5.2
-checkpoint in the local model stores. The official FP8 repository is about 709
-GiB. The recommended grouped-INT4 repository is about 399.8 GiB total;
-excluding the unneeded first-pass MTP shard still requires about 390.5 GiB.
-With 466 GiB free at the final pre-acquisition check, using the internal volume
-would leave only about 75 GiB and is not a safe implicit action. Full
-out-of-core correctness, cache-budget sweeps, memory-pressure measurements, and
-reproducible performance logs require an explicitly authorized acquisition
-target and storage commitment.
+This closed safe implementation work but did not by itself close Phase 6. The
+user later supplied the complete recommended grouped-INT4 repository outside
+the DiskMule workspace. Its metadata digests match the audited revision; its
+141 ordinary shards total `419,296,541,560` bytes and its MTP shard is
+`9,959,321,520` bytes. DiskMule's payload-lazy real-snapshot oracle indexes all
+142 shards and 118,478 unique tensors, validates the 78-layer ordinary graph
+and all 19,200 routed experts, and confirms the expected absence of the DSA
+sidecar. Full out-of-core correctness, cache-budget sweeps, memory-pressure
+measurements, and reproducible performance logs remain Phase 6 work until real
+ordinary decoding succeeds.
 
 ## DiskMule Qwen3.5/Qwen3.8 findings
 
