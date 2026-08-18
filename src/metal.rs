@@ -109,6 +109,15 @@ pub enum MetalError {
         length: usize,
     },
 
+    #[error("Metal KV cache is at position {actual}; expected {expected}")]
+    KvPosition { expected: usize, actual: usize },
+
+    #[error("Metal KV cache width is {actual}; expected {expected}")]
+    KvWidth { expected: usize, actual: usize },
+
+    #[error("Metal KV cache position {position} exceeds its context limit {limit}")]
+    KvContext { position: usize, limit: usize },
+
     #[error("could not create a Metal command buffer or compute encoder")]
     CommandEncoding,
 
@@ -121,7 +130,7 @@ mod implementation {
     use std::{
         alloc::{Layout, alloc_zeroed, dealloc},
         ffi::c_void,
-        ptr::NonNull,
+        ptr::{self, NonNull},
         slice,
         sync::Arc,
     };
@@ -189,6 +198,41 @@ mod implementation {
     pub struct MetalMappedBuffer {
         buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
         mapping: Arc<Mmap>,
+    }
+
+    #[derive(Debug)]
+    pub struct MetalKvLayer {
+        keys: Retained<ProtocolObject<dyn MTLBuffer>>,
+        values: Retained<ProtocolObject<dyn MTLBuffer>>,
+        width: usize,
+        capacity: usize,
+        max_context: usize,
+        position: usize,
+    }
+
+    impl MetalKvLayer {
+        pub fn position(&self) -> usize {
+            self.position
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        pub fn allocated_bytes(&self) -> usize {
+            self.capacity
+                .saturating_mul(self.width)
+                .saturating_mul(std::mem::size_of::<f32>())
+                .saturating_mul(2)
+        }
+
+        pub fn clear(&mut self) {
+            self.position = 0;
+        }
+
+        pub fn truncate(&mut self, position: usize) {
+            self.position = self.position.min(position);
+        }
     }
 
     impl MetalMappedBuffer {
@@ -603,6 +647,134 @@ mod implementation {
             Ok(())
         }
 
+        pub fn new_kv_layer(
+            &self,
+            width: usize,
+            max_context: usize,
+            sliding_window: Option<usize>,
+        ) -> Result<MetalKvLayer, MetalError> {
+            let capacity = sliding_window.unwrap_or(max_context).min(max_context);
+            if width == 0 || capacity == 0 {
+                return Err(MetalError::InvalidAttentionShape(
+                    "KV width and capacity must be non-zero",
+                ));
+            }
+            let elements = width.checked_mul(capacity).ok_or(MetalError::Overflow)?;
+            Ok(MetalKvLayer {
+                keys: self.empty_buffer::<f32>(elements)?,
+                values: self.empty_buffer::<f32>(elements)?,
+                width,
+                capacity,
+                max_context,
+                position: 0,
+            })
+        }
+
+        pub fn append_kv(
+            &self,
+            layer: &mut MetalKvLayer,
+            position: usize,
+            key: &[f32],
+            value: &[f32],
+        ) -> Result<(), MetalError> {
+            if layer.position != position {
+                return Err(MetalError::KvPosition {
+                    expected: position,
+                    actual: layer.position,
+                });
+            }
+            if position >= layer.max_context {
+                return Err(MetalError::KvContext {
+                    position,
+                    limit: layer.max_context,
+                });
+            }
+            if key.len() != layer.width || value.len() != layer.width {
+                return Err(MetalError::KvWidth {
+                    expected: layer.width,
+                    actual: key.len().min(value.len()),
+                });
+            }
+            let slot = position % layer.capacity;
+            let element_offset = slot.checked_mul(layer.width).ok_or(MetalError::Overflow)?;
+            // SAFETY: both shared buffers contain capacity * width f32 values,
+            // the selected ring slot is in range, and all Metal dispatches in
+            // this context complete synchronously before host mutation.
+            unsafe {
+                let key_destination = layer
+                    .keys
+                    .contents()
+                    .as_ptr()
+                    .cast::<f32>()
+                    .add(element_offset);
+                let value_destination = layer
+                    .values
+                    .contents()
+                    .as_ptr()
+                    .cast::<f32>()
+                    .add(element_offset);
+                ptr::copy_nonoverlapping(key.as_ptr(), key_destination, layer.width);
+                ptr::copy_nonoverlapping(value.as_ptr(), value_destination, layer.width);
+            }
+            layer.position += 1;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attention_cached(
+            &self,
+            query: &[f32],
+            cache: &MetalKvLayer,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dimension: usize,
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            if query_heads == 0 || kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+                return Err(MetalError::InvalidAttentionShape(
+                    "query heads must be a non-zero multiple of KV heads",
+                ));
+            }
+            let query_width = query_heads
+                .checked_mul(head_dimension)
+                .ok_or(MetalError::Overflow)?;
+            let expected_cache_width = kv_heads
+                .checked_mul(head_dimension)
+                .ok_or(MetalError::Overflow)?;
+            if query.len() != query_width || output.len() != query_width {
+                return Err(MetalError::InvalidAttentionShape(
+                    "query and output must match query_heads * head_dimension",
+                ));
+            }
+            if cache.width != expected_cache_width {
+                return Err(MetalError::KvWidth {
+                    expected: expected_cache_width,
+                    actual: cache.width,
+                });
+            }
+            if cache.position == 0 {
+                return Err(MetalError::EmptyInput {
+                    operation: "attention",
+                });
+            }
+            let visible = cache.position.min(cache.capacity);
+            let start = cache.position - visible;
+            self.attention_buffers(
+                query,
+                &cache.keys,
+                &cache.values,
+                cache.position,
+                cache.capacity,
+                cache.width,
+                query_heads,
+                kv_heads,
+                head_dimension,
+                start,
+                visible,
+                output,
+            )
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub fn attention(
             &self,
@@ -653,64 +825,22 @@ mod implementation {
                 });
             }
 
-            let query_buffer = self.buffer_with_data(query)?;
             let keys_buffer = self.buffer_with_data(keys)?;
             let values_buffer = self.buffer_with_data(values)?;
-            let scores_len = query_heads
-                .checked_mul(visible)
-                .ok_or(MetalError::Overflow)?;
-            let scores_buffer = self.empty_buffer::<f32>(scores_len)?;
-            let output_buffer = self.empty_buffer::<f32>(output.len())?;
-            let sequence_buffer = self.buffer_with_data(&[count_u32(sequence_length)?])?;
-            let cache_width_buffer = self.buffer_with_data(&[count_u32(cache_width)?])?;
-            let query_heads_buffer = self.buffer_with_data(&[count_u32(query_heads)?])?;
-            let kv_heads_buffer = self.buffer_with_data(&[count_u32(kv_heads)?])?;
-            let head_dimension_buffer = self.buffer_with_data(&[count_u32(head_dimension)?])?;
-            let start_buffer = self.buffer_with_data(&[count_u32(start)?])?;
-            let visible_buffer = self.buffer_with_data(&[count_u32(visible)?])?;
-
-            self.execute(
-                &self.attention_scores,
-                &[
-                    &query_buffer,
-                    &keys_buffer,
-                    &scores_buffer,
-                    &sequence_buffer,
-                    &cache_width_buffer,
-                    &query_heads_buffer,
-                    &kv_heads_buffer,
-                    &head_dimension_buffer,
-                    &start_buffer,
-                ],
-                scores_len,
-                scores_len.min(REDUCTION_THREADS),
-            )?;
-            self.execute(
-                &self.attention_softmax,
-                &[&scores_buffer, &visible_buffer],
-                query_heads
-                    .checked_mul(REDUCTION_THREADS)
-                    .ok_or(MetalError::Overflow)?,
-                REDUCTION_THREADS,
-            )?;
-            self.execute(
-                &self.attention_values,
-                &[
-                    &scores_buffer,
-                    &values_buffer,
-                    &output_buffer,
-                    &visible_buffer,
-                    &start_buffer,
-                    &cache_width_buffer,
-                    &query_heads_buffer,
-                    &kv_heads_buffer,
-                    &head_dimension_buffer,
-                ],
-                output.len(),
-                output.len().min(REDUCTION_THREADS),
-            )?;
-            copy_buffer(&output_buffer, output);
-            Ok(())
+            self.attention_buffers(
+                query,
+                &keys_buffer,
+                &values_buffer,
+                sequence_length,
+                sequence_length,
+                cache_width,
+                query_heads,
+                kv_heads,
+                head_dimension,
+                start,
+                visible,
+                output,
+            )
         }
 
         pub fn top_k_softmax(
@@ -755,6 +885,83 @@ mod implementation {
                 .zip(probabilities)
                 .map(|(index, probability)| (index as usize, probability))
                 .collect())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn attention_buffers(
+            &self,
+            query: &[f32],
+            keys: &ProtocolObject<dyn MTLBuffer>,
+            values: &ProtocolObject<dyn MTLBuffer>,
+            sequence_length: usize,
+            cache_capacity: usize,
+            cache_width: usize,
+            query_heads: usize,
+            kv_heads: usize,
+            head_dimension: usize,
+            start: usize,
+            visible: usize,
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            let query_buffer = self.buffer_with_data(query)?;
+            let scores_len = query_heads
+                .checked_mul(visible)
+                .ok_or(MetalError::Overflow)?;
+            let scores_buffer = self.empty_buffer::<f32>(scores_len)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let sequence_buffer = self.buffer_with_data(&[count_u32(sequence_length)?])?;
+            let cache_capacity_buffer = self.buffer_with_data(&[count_u32(cache_capacity)?])?;
+            let cache_width_buffer = self.buffer_with_data(&[count_u32(cache_width)?])?;
+            let query_heads_buffer = self.buffer_with_data(&[count_u32(query_heads)?])?;
+            let kv_heads_buffer = self.buffer_with_data(&[count_u32(kv_heads)?])?;
+            let head_dimension_buffer = self.buffer_with_data(&[count_u32(head_dimension)?])?;
+            let start_buffer = self.buffer_with_data(&[count_u32(start)?])?;
+            let visible_buffer = self.buffer_with_data(&[count_u32(visible)?])?;
+
+            self.execute(
+                &self.attention_scores,
+                &[
+                    &query_buffer,
+                    keys,
+                    &scores_buffer,
+                    &sequence_buffer,
+                    &cache_width_buffer,
+                    &query_heads_buffer,
+                    &kv_heads_buffer,
+                    &head_dimension_buffer,
+                    &start_buffer,
+                    &cache_capacity_buffer,
+                ],
+                scores_len,
+                scores_len.min(REDUCTION_THREADS),
+            )?;
+            self.execute(
+                &self.attention_softmax,
+                &[&scores_buffer, &visible_buffer],
+                query_heads
+                    .checked_mul(REDUCTION_THREADS)
+                    .ok_or(MetalError::Overflow)?,
+                REDUCTION_THREADS,
+            )?;
+            self.execute(
+                &self.attention_values,
+                &[
+                    &scores_buffer,
+                    values,
+                    &output_buffer,
+                    &visible_buffer,
+                    &start_buffer,
+                    &cache_width_buffer,
+                    &query_heads_buffer,
+                    &kv_heads_buffer,
+                    &head_dimension_buffer,
+                    &cache_capacity_buffer,
+                ],
+                output.len(),
+                output.len().min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
         }
 
         fn prepare_matvec(
@@ -1368,11 +1575,38 @@ mod implementation {
                 .unwrap();
             assert_close(&actual, &expected, 2.0e-6);
         }
+
+        #[test]
+        fn resident_kv_cache_wraps_at_the_sliding_window() {
+            let context = MetalContext::new().unwrap();
+            let mut cache = context.new_kv_layer(2, 10, Some(2)).unwrap();
+            assert_eq!(cache.capacity(), 2);
+            assert_eq!(cache.allocated_bytes(), 32);
+            context
+                .append_kv(&mut cache, 0, &[1.0, 0.0], &[100.0, 100.0])
+                .unwrap();
+            context
+                .append_kv(&mut cache, 1, &[1.0, 0.0], &[2.0, 4.0])
+                .unwrap();
+            context
+                .append_kv(&mut cache, 2, &[1.0, 0.0], &[6.0, 8.0])
+                .unwrap();
+            let mut output = [0.0; 2];
+            context
+                .attention_cached(&[1.0, 0.0], &cache, 1, 1, 2, &mut output)
+                .unwrap();
+            assert_close(&output, &[4.0, 6.0], 1.0e-6);
+            assert_eq!(cache.position(), 3);
+            cache.truncate(2);
+            assert_eq!(cache.position(), 2);
+            cache.clear();
+            assert_eq!(cache.position(), 0);
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-pub use implementation::{MetalContext, MetalMappedBuffer};
+pub use implementation::{MetalContext, MetalKvLayer, MetalMappedBuffer};
 
 #[cfg(not(target_os = "macos"))]
 #[derive(Debug)]

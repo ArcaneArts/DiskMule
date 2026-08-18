@@ -6,10 +6,61 @@ use crate::{
     cpu::{tensor_row, tensor_vector},
     gemma4::{Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS},
     gguf::TensorSource,
-    metal::{MetalContext, MetalMappedBuffer},
+    metal::{MetalContext, MetalKvLayer, MetalMappedBuffer},
 };
 
-use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, KvCache, RuntimeError};
+use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, RuntimeError};
+
+#[derive(Debug)]
+pub struct MetalKvCache {
+    layers: Vec<MetalKvLayer>,
+    max_context: usize,
+}
+
+impl MetalKvCache {
+    pub fn len(&self) -> usize {
+        self.layers.first().map_or(0, MetalKvLayer::position)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.layers.iter().map(MetalKvLayer::allocated_bytes).sum()
+    }
+
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    fn position(&self) -> Result<usize, RuntimeError> {
+        let position = self.len();
+        if self.layers.iter().all(|layer| layer.position() == position) {
+            Ok(position)
+        } else {
+            Err(RuntimeError::CachePosition {
+                expected: position,
+                actual: self
+                    .layers
+                    .iter()
+                    .map(MetalKvLayer::position)
+                    .find(|length| *length != position)
+                    .unwrap_or(position),
+            })
+        }
+    }
+
+    fn truncate(&mut self, position: usize) {
+        for layer in &mut self.layers {
+            layer.truncate(position);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Gemma4MetalModel {
@@ -71,8 +122,25 @@ impl Gemma4MetalModel {
         self.metal.device_name()
     }
 
-    pub fn new_cache(&self) -> KvCache {
-        KvCache::new(&self.config, self.max_context)
+    pub fn new_cache(&self) -> Result<MetalKvCache, RuntimeError> {
+        let mut layers = Vec::with_capacity(self.config.layer_count as usize);
+        for (layer, sliding) in self.config.sliding_layers.iter().copied().enumerate() {
+            let head_dimension = if sliding {
+                self.config.key_length_swa as usize
+            } else {
+                self.config.key_length as usize
+            };
+            let width = self.config.kv_heads_by_layer[layer] as usize * head_dimension;
+            layers.push(self.metal.new_kv_layer(
+                width,
+                self.max_context,
+                sliding.then_some(self.config.sliding_window as usize),
+            )?);
+        }
+        Ok(MetalKvCache {
+            layers,
+            max_context: self.max_context,
+        })
     }
 
     pub fn generate_greedy<F>(
@@ -102,9 +170,10 @@ impl Gemma4MetalModel {
         }
 
         let started = Instant::now();
-        let mut cache = self.new_cache();
+        let mut cache = self.new_cache()?;
         let mut profile = GenerationProfile {
             prompt_tokens: prompt_tokens.len(),
+            resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
         let mut logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
@@ -159,9 +228,10 @@ impl Gemma4MetalModel {
             });
         }
         let started = Instant::now();
-        let mut cache = self.new_cache();
+        let mut cache = self.new_cache()?;
         let mut profile = GenerationProfile {
             prompt_tokens: prompt_tokens.len(),
+            resident_kv_bytes: u64::try_from(cache.allocated_bytes()).unwrap_or(u64::MAX),
             ..GenerationProfile::default()
         };
         let logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
@@ -172,7 +242,7 @@ impl Gemma4MetalModel {
     fn prefill(
         &self,
         prompt_tokens: &[u32],
-        cache: &mut KvCache,
+        cache: &mut MetalKvCache,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
     ) -> Result<Vec<f32>, RuntimeError> {
@@ -195,7 +265,7 @@ impl Gemma4MetalModel {
         &self,
         token: u32,
         position: usize,
-        cache: &mut KvCache,
+        cache: &mut MetalKvCache,
         produce_logits: bool,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
@@ -237,7 +307,7 @@ impl Gemma4MetalModel {
         &self,
         token: u32,
         position: usize,
-        cache: &mut KvCache,
+        cache: &mut MetalKvCache,
         produce_logits: bool,
         cancellation: &CancellationFlag,
         profile: &mut GenerationProfile,
@@ -318,17 +388,16 @@ impl Gemma4MetalModel {
                 position,
                 rope_theta,
             )?;
-            cache.layers[layer_index].append(position, &key, &value)?;
+            self.metal
+                .append_kv(&mut cache.layers[layer_index], position, &key, &value)?;
             let layer_cache = &cache.layers[layer_index];
             let mut attention = vec![0.0_f32; query.len()];
-            self.metal.attention(
+            self.metal.attention_cached(
                 &query,
-                &layer_cache.keys,
-                &layer_cache.values,
+                layer_cache,
                 query_heads,
                 kv_heads,
                 head_dimension,
-                sliding.then_some(self.config.sliding_window as usize),
                 &mut attention,
             )?;
             let mut projected_attention = vec![0.0_f32; hidden_size];

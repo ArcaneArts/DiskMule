@@ -96,6 +96,7 @@ pub struct GenerationProfile {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub mapped_bytes_touched: u64,
+    pub resident_kv_bytes: u64,
     pub embedding_time: Duration,
     pub attention_time: Duration,
     pub feed_forward_time: Duration,

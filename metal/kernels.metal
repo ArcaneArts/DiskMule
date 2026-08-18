@@ -366,14 +366,16 @@ kernel void attention_scores(
     constant uint &kv_heads [[buffer(6)]],
     constant uint &head_dimension [[buffer(7)]],
     constant uint &start [[buffer(8)]],
+    constant uint &cache_capacity [[buffer(9)]],
     uint index [[thread_position_in_grid]]) {
     const uint visible = sequence_length - start;
     const uint query_head = index / visible;
     const uint score_index = index % visible;
     const uint kv_head = query_head / (query_heads / kv_heads);
     const uint position = start + score_index;
+    const uint cache_position = position % cache_capacity;
     const uint query_base = query_head * head_dimension;
-    const uint key_base = position * cache_width + kv_head * head_dimension;
+    const uint key_base = cache_position * cache_width + kv_head * head_dimension;
     float sum = 0.0f;
     for (uint dimension = 0; dimension < head_dimension; dimension++) {
         sum = fma(query[query_base + dimension], keys[key_base + dimension], sum);
@@ -432,6 +434,7 @@ kernel void attention_values(
     constant uint &query_heads [[buffer(6)]],
     constant uint &kv_heads [[buffer(7)]],
     constant uint &head_dimension [[buffer(8)]],
+    constant uint &cache_capacity [[buffer(9)]],
     uint index [[thread_position_in_grid]]) {
     const uint query_head = index / head_dimension;
     const uint dimension = index % head_dimension;
@@ -439,7 +442,9 @@ kernel void attention_values(
     float sum = 0.0f;
     for (uint score_index = 0; score_index < visible; score_index++) {
         const uint position = start + score_index;
-        const uint value_index = position * cache_width + kv_head * head_dimension + dimension;
+        const uint cache_position = position % cache_capacity;
+        const uint value_index = cache_position * cache_width
+            + kv_head * head_dimension + dimension;
         sum = fma(values[value_index], probabilities[query_head * visible + score_index], sum);
     }
     output[index] = sum;
