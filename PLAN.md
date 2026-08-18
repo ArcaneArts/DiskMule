@@ -49,6 +49,8 @@ diskmule rm <model>
 ### `diskmule --serve`
 
 - Start a foreground local HTTP inference server.
+- Bind to `127.0.0.1:11435` by default so the first pass remains local-only and
+  does not conflict with Ollama's usual port.
 - Reuse exactly the same model registry, loader, sessions, and generation
   engine as the CLI.
 - Stream generation responses and expose health and loaded-model information.
@@ -95,6 +97,10 @@ The first implementation should:
 The existing local `gemma4:26b` resolves to a roughly 17 GB Q4_K_M GGUF with
 25.8B parameters. It will be the first interoperability fixture, but tests must
 not hard-code its user-specific absolute blob path.
+
+DiskMule-managed models use a versioned `registry.json` containing names and
+paths relative to the managed model root. Ollama entries and direct local paths
+remain external, read-only catalog records and are never adopted implicitly.
 
 ## Runtime architecture
 
