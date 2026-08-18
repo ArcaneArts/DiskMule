@@ -175,28 +175,13 @@ impl Gemma4CpuModel {
             prompt_tokens: prompt_tokens.len(),
             ..GenerationProfile::default()
         };
-        let mut logits = None;
-        for (position, token) in prompt_tokens.iter().copied().enumerate() {
-            cancellation.check()?;
-            logits = self.forward_token(
-                token,
-                position,
-                &mut cache,
-                position + 1 == prompt_tokens.len(),
-                cancellation,
-                &mut profile,
-            )?;
-        }
+        let mut logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
 
         let mut generated = Vec::with_capacity(maximum_new_tokens);
         let mut stopped = false;
         for generation_index in 0..maximum_new_tokens {
             cancellation.check()?;
-            let next = argmax(
-                logits
-                    .as_deref()
-                    .expect("last prefill token produces logits"),
-            )? as u32;
+            let next = argmax(&logits)? as u32;
             if self.tokenizer.stop_token_ids.contains(&next) {
                 stopped = true;
                 break;
@@ -206,14 +191,16 @@ impl Gemma4CpuModel {
             generated.push(next);
             profile.generated_tokens += 1;
             if generation_index + 1 < maximum_new_tokens {
-                logits = self.forward_token(
-                    next,
-                    prompt_tokens.len() + generation_index,
-                    &mut cache,
-                    true,
-                    cancellation,
-                    &mut profile,
-                )?;
+                logits = self
+                    .forward_token(
+                        next,
+                        prompt_tokens.len() + generation_index,
+                        &mut cache,
+                        true,
+                        cancellation,
+                        &mut profile,
+                    )?
+                    .expect("decode requests logits");
             }
         }
         profile.total_time = started.elapsed();
@@ -224,6 +211,54 @@ impl Gemma4CpuModel {
             stopped,
             profile,
         })
+    }
+
+    /// Compute deterministic, softcapped next-token logits for one prompt.
+    pub fn prompt_logits(
+        &self,
+        prompt_tokens: &[u32],
+        cancellation: &CancellationFlag,
+    ) -> Result<(Vec<f32>, GenerationProfile), RuntimeError> {
+        if prompt_tokens.is_empty() {
+            return Err(RuntimeError::EmptyPrompt);
+        }
+        if prompt_tokens.len() > self.max_context {
+            return Err(RuntimeError::ContextLimit {
+                requested: prompt_tokens.len(),
+                limit: self.max_context,
+            });
+        }
+        let started = Instant::now();
+        let mut cache = self.new_cache();
+        let mut profile = GenerationProfile {
+            prompt_tokens: prompt_tokens.len(),
+            ..GenerationProfile::default()
+        };
+        let logits = self.prefill(prompt_tokens, &mut cache, cancellation, &mut profile)?;
+        profile.total_time = started.elapsed();
+        Ok((logits, profile))
+    }
+
+    fn prefill(
+        &self,
+        prompt_tokens: &[u32],
+        cache: &mut KvCache,
+        cancellation: &CancellationFlag,
+        profile: &mut GenerationProfile,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let mut logits = None;
+        for (position, token) in prompt_tokens.iter().copied().enumerate() {
+            cancellation.check()?;
+            logits = self.forward_token(
+                token,
+                position,
+                cache,
+                position + 1 == prompt_tokens.len(),
+                cancellation,
+                profile,
+            )?;
+        }
+        Ok(logits.expect("non-empty prefill produces final logits"))
     }
 
     fn forward_token(

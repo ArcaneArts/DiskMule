@@ -45,6 +45,23 @@ fn greedy_kv_decode_matches_the_local_ollama_reference() {
     }
     let blob = root.join("blobs").join(EXPECTED_DIGEST.replace(':', "-"));
     let model = Gemma4CpuModel::open(blob, 8).unwrap();
+    let (logits, logits_profile) = model
+        .prompt_logits(&[model.tokenizer.bos_id], &CancellationFlag::default())
+        .unwrap();
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp = logits
+        .iter()
+        .map(|logit| (*logit - maximum).exp())
+        .sum::<f32>()
+        .ln()
+        + maximum;
+    let winning_log_probability = logits[47_610] - log_sum_exp;
+    eprintln!("DiskMule winning logprob: {winning_log_probability}");
+    eprintln!("DiskMule logits profile: {logits_profile:#?}");
+    assert!(
+        (winning_log_probability - -4.024_969_6).abs() < 0.02,
+        "DiskMule/Ollama logprob mismatch: {winning_log_probability} versus -4.0249696"
+    );
     let result = model
         .generate_greedy(
             &[model.tokenizer.bos_id],
