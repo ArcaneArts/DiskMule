@@ -12,6 +12,8 @@ use std::{
     sync::Arc,
 };
 
+use memmap2::{Mmap, MmapOptions};
+
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
@@ -608,6 +610,7 @@ impl GgufFile {
 pub struct TensorSource {
     path: PathBuf,
     file: Arc<File>,
+    mapping: Mmap,
     pub gguf: GgufFile,
     tensor_indices: HashMap<String, usize>,
 }
@@ -632,6 +635,10 @@ impl TensorSource {
             &path.display().to_string(),
             &captured_keys,
         )?;
+        // SAFETY: the descriptor is opened read-only and retained for the
+        // complete lifetime of the immutable mapping. DiskMule never mutates
+        // external model files.
+        let mapping = unsafe { MmapOptions::new().map(&file)? };
         let file = Arc::new(file);
         let tensor_indices = gguf
             .tensors
@@ -642,6 +649,7 @@ impl TensorSource {
         Ok(Self {
             path,
             file,
+            mapping,
             gguf,
             tensor_indices,
         })
@@ -655,6 +663,21 @@ impl TensorSource {
         self.tensor_indices
             .get(name)
             .map(|index| &self.gguf.tensors[*index])
+    }
+
+    /// Borrow one tensor's validated payload directly from the read-only map.
+    pub fn tensor_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.tensor_indices
+            .get(name)
+            .and_then(|index| self.tensor_bytes_by_index(*index))
+    }
+
+    /// Borrow a tensor payload by GGUF index without copying it.
+    pub fn tensor_bytes_by_index(&self, index: usize) -> Option<&[u8]> {
+        let tensor = self.gguf.tensors.get(index)?;
+        let start = usize::try_from(tensor.absolute_offset).ok()?;
+        let length = usize::try_from(tensor.byte_len).ok()?;
+        self.mapping.get(start..start.checked_add(length)?)
     }
 
     /// Read a bounded subrange of one tensor without moving shared file state.
@@ -1360,6 +1383,11 @@ mod tests {
         let source = Arc::new(TensorSource::open(file.path()).unwrap());
         assert_eq!(source.path(), file.path());
         assert_eq!(source.tensor("weight").unwrap().byte_len, 18);
+        assert_eq!(
+            source.tensor_bytes("weight"),
+            Some((0_u8..18).collect::<Vec<_>>().as_slice())
+        );
+        assert_eq!(source.tensor_bytes_by_index(1), None);
 
         let readers: Vec<_> = [(0_u64, vec![0, 1, 2, 3]), (10, vec![10, 11, 12, 13])]
             .into_iter()

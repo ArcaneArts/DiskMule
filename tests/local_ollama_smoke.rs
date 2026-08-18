@@ -9,6 +9,7 @@ use serde::Deserialize;
 use tempfile::TempDir;
 
 use diskmule::{
+    cpu::{tensor_expert_matvec, tensor_matvec, tensor_row, tensor_vector},
     gemma4::{
         ChatMessage, ChatRole, Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS,
         render_chat,
@@ -79,6 +80,32 @@ fn installed_gemma_is_listed_inspected_and_protected() {
             .dimensions,
         [2_816, 1_408, 128]
     );
+    let mut norm = vec![0.0_f32; 2_816];
+    tensor_vector(&source, weights.output_norm, &mut norm).unwrap();
+    assert!(norm.iter().all(|value| value.is_finite()));
+    let mut embedding = vec![0.0_f32; 2_816];
+    tensor_row(&source, weights.token_embedding, 2, &mut embedding).unwrap();
+    assert!(embedding.iter().all(|value| value.is_finite()));
+    let input = vec![0.001_f32; 2_816];
+    let mut routing_logits = vec![0.0_f32; 128];
+    tensor_matvec(
+        &source,
+        weights.layers[0].router,
+        &input,
+        &mut routing_logits,
+    )
+    .unwrap();
+    assert!(routing_logits.iter().all(|value| value.is_finite()));
+    let mut expert_gate_up = vec![0.0_f32; 1_408];
+    tensor_expert_matvec(
+        &source,
+        weights.layers[0].expert_gate_up,
+        0,
+        &input,
+        &mut expert_gate_up,
+    )
+    .unwrap();
+    assert!(expert_gate_up.iter().all(|value| value.is_finite()));
     let tokenizer = Gemma4Tokenizer::take_from_gguf(&mut source.gguf).unwrap();
     assert_eq!(tokenizer.vocab_size(), 262_144);
     assert_eq!(tokenizer.bos_id, 2);

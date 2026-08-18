@@ -3,7 +3,9 @@
 //! These prioritize transparent, deterministic arithmetic over throughput.
 //! Metal kernels and future vectorized paths are compared against this module.
 
-use crate::gguf::TensorType;
+use rayon::prelude::*;
+
+use crate::gguf::{TensorSource, TensorType};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CpuError {
@@ -67,6 +69,30 @@ pub enum CpuError {
 
     #[error("{operation} requires a finite positive parameter")]
     InvalidPositiveParameter { operation: &'static str },
+
+    #[error("tensor index {index} is outside the {count}-tensor GGUF index")]
+    InvalidTensorIndex { index: usize, count: usize },
+
+    #[error("tensor {tensor:?} has rank {actual}; expected rank {expected}")]
+    InvalidTensorRank {
+        tensor: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error("tensor {tensor:?} row {row} is outside its {rows} rows")]
+    InvalidTensorRow {
+        tensor: String,
+        row: usize,
+        rows: usize,
+    },
+
+    #[error("tensor {tensor:?} expert {expert} is outside its {experts} experts")]
+    InvalidTensorExpert {
+        tensor: String,
+        expert: usize,
+        experts: usize,
+    },
 }
 
 /// FP32 RMS normalization with an optional learned per-feature weight.
@@ -355,16 +381,166 @@ pub fn matvec(
         });
     }
 
-    let mut row = vec![0.0_f32; columns];
-    for (row_index, result) in output.iter_mut().enumerate() {
-        let start = row_index * row_bytes;
-        dequantize(kind, &encoded[start..start + row_bytes], &mut row)?;
-        *result = row
-            .iter()
-            .zip(input)
-            .fold(0.0_f32, |sum, (weight, value)| sum + weight * value);
+    encoded
+        .par_chunks_exact(row_bytes)
+        .zip(output.par_iter_mut())
+        .try_for_each_init(
+            || vec![0.0_f32; columns],
+            |row, (encoded, result)| {
+                dequantize(kind, encoded, row)?;
+                *result = row
+                    .iter()
+                    .zip(input)
+                    .fold(0.0_f32, |sum, (weight, value)| weight.mul_add(*value, sum));
+                Ok::<(), CpuError>(())
+            },
+        )?;
+    Ok(())
+}
+
+/// Decode a rank-one tensor from a mapped GGUF source.
+pub fn tensor_vector(
+    source: &TensorSource,
+    tensor_index: usize,
+    output: &mut [f32],
+) -> Result<(), CpuError> {
+    let tensor = tensor_at(source, tensor_index)?;
+    require_rank(tensor.name.as_str(), tensor.dimensions.len(), 1)?;
+    validate_vector_length(
+        "tensor vector",
+        "output",
+        dimension(tensor.dimensions[0])?,
+        output.len(),
+    )?;
+    let encoded =
+        source
+            .tensor_bytes_by_index(tensor_index)
+            .ok_or(CpuError::InvalidTensorIndex {
+                index: tensor_index,
+                count: source.gguf.tensors.len(),
+            })?;
+    dequantize(tensor.kind, encoded, output)
+}
+
+/// Decode one row from a mapped rank-two tensor.
+pub fn tensor_row(
+    source: &TensorSource,
+    tensor_index: usize,
+    row: usize,
+    output: &mut [f32],
+) -> Result<(), CpuError> {
+    let tensor = tensor_at(source, tensor_index)?;
+    require_rank(tensor.name.as_str(), tensor.dimensions.len(), 2)?;
+    let columns = dimension(tensor.dimensions[0])?;
+    let rows = dimension(tensor.dimensions[1])?;
+    if row >= rows {
+        return Err(CpuError::InvalidTensorRow {
+            tensor: tensor.name.clone(),
+            row,
+            rows,
+        });
+    }
+    validate_vector_length("tensor row", "output", columns, output.len())?;
+    let row_bytes = tensor
+        .kind
+        .row_byte_len(tensor.dimensions[0])
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or(CpuError::Overflow)?;
+    let start = row.checked_mul(row_bytes).ok_or(CpuError::Overflow)?;
+    let bytes = tensor_bytes(source, tensor_index)?;
+    dequantize(tensor.kind, &bytes[start..start + row_bytes], output)
+}
+
+/// Apply a mapped rank-two GGUF matrix to one FP32 vector.
+pub fn tensor_matvec(
+    source: &TensorSource,
+    tensor_index: usize,
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), CpuError> {
+    let tensor = tensor_at(source, tensor_index)?;
+    require_rank(tensor.name.as_str(), tensor.dimensions.len(), 2)?;
+    matvec(
+        tensor.kind,
+        dimension(tensor.dimensions[1])?,
+        dimension(tensor.dimensions[0])?,
+        tensor_bytes(source, tensor_index)?,
+        input,
+        output,
+    )
+}
+
+/// Apply one contiguous expert matrix from a mapped rank-three GGUF tensor.
+pub fn tensor_expert_matvec(
+    source: &TensorSource,
+    tensor_index: usize,
+    expert: usize,
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), CpuError> {
+    let tensor = tensor_at(source, tensor_index)?;
+    require_rank(tensor.name.as_str(), tensor.dimensions.len(), 3)?;
+    let columns = dimension(tensor.dimensions[0])?;
+    let rows = dimension(tensor.dimensions[1])?;
+    let experts = dimension(tensor.dimensions[2])?;
+    if expert >= experts {
+        return Err(CpuError::InvalidTensorExpert {
+            tensor: tensor.name.clone(),
+            expert,
+            experts,
+        });
+    }
+    let row_bytes = tensor
+        .kind
+        .row_byte_len(tensor.dimensions[0])
+        .and_then(|length| usize::try_from(length).ok())
+        .ok_or(CpuError::Overflow)?;
+    let expert_bytes = rows.checked_mul(row_bytes).ok_or(CpuError::Overflow)?;
+    let start = expert.checked_mul(expert_bytes).ok_or(CpuError::Overflow)?;
+    let bytes = tensor_bytes(source, tensor_index)?;
+    matvec(
+        tensor.kind,
+        rows,
+        columns,
+        &bytes[start..start + expert_bytes],
+        input,
+        output,
+    )
+}
+
+fn tensor_at(source: &TensorSource, index: usize) -> Result<&crate::gguf::TensorInfo, CpuError> {
+    source
+        .gguf
+        .tensors
+        .get(index)
+        .ok_or(CpuError::InvalidTensorIndex {
+            index,
+            count: source.gguf.tensors.len(),
+        })
+}
+
+fn tensor_bytes(source: &TensorSource, index: usize) -> Result<&[u8], CpuError> {
+    source
+        .tensor_bytes_by_index(index)
+        .ok_or(CpuError::InvalidTensorIndex {
+            index,
+            count: source.gguf.tensors.len(),
+        })
+}
+
+fn require_rank(tensor: &str, actual: usize, expected: usize) -> Result<(), CpuError> {
+    if actual != expected {
+        return Err(CpuError::InvalidTensorRank {
+            tensor: tensor.to_owned(),
+            expected,
+            actual,
+        });
     }
     Ok(())
+}
+
+fn dimension(value: u64) -> Result<usize, CpuError> {
+    usize::try_from(value).map_err(|_| CpuError::Overflow)
 }
 
 fn decode_f32(encoded: &[u8], output: &mut [f32]) {
