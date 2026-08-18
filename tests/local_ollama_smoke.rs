@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -49,6 +50,54 @@ fn installed_gemma_is_listed_inspected_and_protected() {
         .and_then(MetadataArray::as_strings)
         .expect("Gemma GGUF should expose its tokenizer vocabulary");
     assert_eq!(tokens.len(), 262_144);
+    let tensor_type_counts =
+        source
+            .gguf
+            .tensors
+            .iter()
+            .fold(BTreeMap::<_, usize>::new(), |mut counts, tensor| {
+                *counts.entry(tensor.kind.name()).or_default() += 1;
+                counts
+            });
+    assert_eq!(
+        tensor_type_counts,
+        BTreeMap::from([
+            ("F16", 191),
+            ("F32", 557),
+            ("Q4_K", 193),
+            ("Q5_0", 32),
+            ("Q6_K", 13),
+            ("Q8_0", 28),
+        ])
+    );
+    for kind in [
+        diskmule::gguf::TensorType::F16,
+        diskmule::gguf::TensorType::F32,
+        diskmule::gguf::TensorType::Q4K,
+        diskmule::gguf::TensorType::Q5_0,
+        diskmule::gguf::TensorType::Q6K,
+        diskmule::gguf::TensorType::Q8_0,
+    ] {
+        let tensor = source
+            .gguf
+            .tensors
+            .iter()
+            .find(|tensor| tensor.kind == kind)
+            .unwrap();
+        let columns = tensor.dimensions[0];
+        let mut encoded = vec![0_u8; kind.row_byte_len(columns).unwrap() as usize];
+        source
+            .read_tensor_at(&tensor.name, 0, &mut encoded)
+            .unwrap();
+        let mut decoded = vec![0.0_f32; columns as usize];
+        diskmule::cpu::dequantize(kind, &encoded, &mut decoded).unwrap();
+        assert!(
+            decoded.iter().all(|value| value.is_finite()),
+            "{} decoded non-finite values from {}",
+            kind.name(),
+            tensor.name
+        );
+    }
     let first_tensor = &source.gguf.tensors[0];
     let mut tensor_prefix = [0_u8; 16];
     source

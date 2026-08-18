@@ -311,6 +311,22 @@ impl TensorType {
         }
     }
 
+    pub fn block_elements(self) -> u64 {
+        self.layout().0
+    }
+
+    pub fn block_bytes(self) -> u64 {
+        self.layout().1
+    }
+
+    pub fn row_byte_len(self, elements: u64) -> Option<u64> {
+        let (block_elements, block_bytes) = self.layout();
+        elements
+            .is_multiple_of(block_elements)
+            .then(|| (elements / block_elements).checked_mul(block_bytes))
+            .flatten()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::F32 => "F32",
