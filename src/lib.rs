@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod error;
 pub mod gemma4;
 pub mod gguf;
+pub mod metal;
 pub mod model;
 pub mod server;
 
