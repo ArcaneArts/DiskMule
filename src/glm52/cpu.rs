@@ -1,11 +1,25 @@
-//! Payload-lazy CPU tensor operations for GLM-5.2 safetensors weights.
+//! Payload-lazy CPU execution for GLM-5.2 safetensors weights.
 
-use crate::safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+use crate::{
+    glm52::{
+        Glm52Config, Glm52Error, Glm52FeedForwardWeights, Glm52IndexerWeights, Glm52LayerWeights,
+        Glm52Weights, IndexerKind,
+    },
+    safetensors::{SafeDtype, SafeTensorError, SafeTensorInfo, SafeTensorSource},
+};
 
 const FP8_BLOCK: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Glm52CpuError {
+    #[error(transparent)]
+    Model(#[from] Glm52Error),
+
     #[error(transparent)]
     SafeTensor(#[from] SafeTensorError),
 
@@ -54,6 +68,505 @@ pub enum Glm52CpuError {
 
     #[error("integer arithmetic overflow while reading tensor {0:?}")]
     Overflow(String),
+
+    #[error("token ID {token} is outside the GLM-5.2 vocabulary of {vocabulary} tokens")]
+    TokenOutOfRange { token: u32, vocabulary: usize },
+
+    #[error("GLM-5.2 session reached its {maximum}-token context limit")]
+    ContextExceeded { maximum: usize },
+
+    #[error("GLM-5.2 session has {actual} layer caches; expected {expected}")]
+    SessionLayers { expected: usize, actual: usize },
+
+    #[error("GLM-5.2 generation was cancelled")]
+    Cancelled,
+
+    #[error("GLM-5.2 router produced a non-finite score in layer {layer}, expert {expert}")]
+    InvalidRouterScore { layer: usize, expert: usize },
+
+    #[error("GLM-5.2 shared DSA layer {layer} has no preceding full-layer selection")]
+    MissingDsaSelection { layer: usize },
+}
+
+/// A loaded CPU model. Dense tensors remain on disk and are read by range as needed.
+pub struct Glm52CpuModel {
+    pub config: Glm52Config,
+    pub weights: Glm52Weights,
+    source: SafeTensorSource,
+}
+
+#[derive(Debug, Clone)]
+pub struct Glm52CpuSession {
+    maximum_context: usize,
+    layers: Vec<Glm52LayerCache>,
+    dsa_selection: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Glm52LayerCache {
+    latent: Vec<Vec<f32>>,
+    rope: Vec<Vec<f32>>,
+    index_keys: Vec<Vec<f32>>,
+}
+
+impl Glm52CpuModel {
+    pub fn from_directory(directory: impl AsRef<Path>) -> Result<Self, Glm52CpuError> {
+        let directory = directory.as_ref();
+        let config = Glm52Config::from_directory(directory)?;
+        let source = SafeTensorSource::open(directory)?;
+        let weights = Glm52Weights::from_index(&source.index, &config)?;
+        Ok(Self {
+            config,
+            weights,
+            source,
+        })
+    }
+
+    pub fn start_session(&self, maximum_context: usize) -> Glm52CpuSession {
+        Glm52CpuSession {
+            maximum_context,
+            layers: vec![Glm52LayerCache::default(); self.config.layer_count],
+            dsa_selection: None,
+        }
+    }
+
+    /// Appends one token and returns its next-token logits.
+    ///
+    /// Cache changes are rolled back if an I/O, validation, or cancellation error occurs.
+    pub fn forward_token(
+        &self,
+        session: &mut Glm52CpuSession,
+        token: u32,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
+        if session.layers.len() != self.config.layer_count {
+            return Err(Glm52CpuError::SessionLayers {
+                expected: self.config.layer_count,
+                actual: session.layers.len(),
+            });
+        }
+        if token as usize >= self.config.vocabulary_size {
+            return Err(Glm52CpuError::TokenOutOfRange {
+                token,
+                vocabulary: self.config.vocabulary_size,
+            });
+        }
+        let position = session.position();
+        if position >= session.maximum_context {
+            return Err(Glm52CpuError::ContextExceeded {
+                maximum: session.maximum_context,
+            });
+        }
+        let previous_selection = session.dsa_selection.clone();
+        let result = self.forward_token_inner(session, token, position, cancelled);
+        if result.is_err() {
+            for layer in &mut session.layers {
+                layer.latent.truncate(position);
+                layer.rope.truncate(position);
+                layer.index_keys.truncate(position);
+            }
+            session.dsa_selection = previous_selection;
+        }
+        result
+    }
+
+    fn forward_token_inner(
+        &self,
+        session: &mut Glm52CpuSession,
+        token: u32,
+        position: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
+        check_cancelled(cancelled)?;
+        let reader = TensorReader::new(&self.source);
+        let mut hidden = reader.matrix_row(self.weights.token_embedding, token as usize)?;
+        for (layer_index, weights) in self.weights.layers.iter().enumerate() {
+            check_cancelled(cancelled)?;
+            let input_norm = reader.vector(weights.input_norm)?;
+            let normalized = rms_norm(&hidden, &input_norm, self.config.rms_epsilon);
+            let attention = self.attention(
+                &reader,
+                session,
+                layer_index,
+                weights,
+                &normalized,
+                position,
+                cancelled,
+            )?;
+            add_in_place(&mut hidden, &attention);
+
+            let post_norm = reader.vector(weights.post_attention_norm)?;
+            let normalized = rms_norm(&hidden, &post_norm, self.config.rms_epsilon);
+            let feed_forward = self.feed_forward(
+                &reader,
+                layer_index,
+                &weights.feed_forward,
+                &normalized,
+                cancelled,
+            )?;
+            add_in_place(&mut hidden, &feed_forward);
+        }
+        check_cancelled(cancelled)?;
+        let final_norm = reader.vector(self.weights.output_norm)?;
+        let normalized = rms_norm(&hidden, &final_norm, self.config.rms_epsilon);
+        reader.matvec(self.weights.output, &normalized)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &self,
+        reader: &TensorReader<'_>,
+        session: &mut Glm52CpuSession,
+        layer_index: usize,
+        weights: &Glm52LayerWeights,
+        hidden: &[f32],
+        position: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
+        let config = &self.config;
+        let query_a = reader.matvec(weights.query_a, hidden)?;
+        let query_norm = reader.vector(weights.query_a_norm)?;
+        let query_latent = rms_norm(&query_a, &query_norm, config.rms_epsilon);
+        let mut query = reader.matvec(weights.query_b, &query_latent)?;
+        let query_head_size = config.query_key_nope_size + config.query_key_rope_size;
+        for head in 0..config.attention_heads {
+            let start = head * query_head_size + config.query_key_nope_size;
+            rope_interleaved_prefix(
+                &mut query[start..start + config.query_key_rope_size],
+                config.query_key_rope_size,
+                position,
+                config.rope_theta,
+            );
+        }
+
+        let compressed = reader.matvec(weights.kv_a, hidden)?;
+        let kv_norm = reader.vector(weights.kv_a_norm)?;
+        let latent = rms_norm(
+            &compressed[..config.kv_lora_rank],
+            &kv_norm,
+            config.rms_epsilon,
+        );
+        let mut rope = compressed[config.kv_lora_rank..].to_vec();
+        rope_interleaved_prefix(
+            &mut rope,
+            config.query_key_rope_size,
+            position,
+            config.rope_theta,
+        );
+
+        let cache = &mut session.layers[layer_index];
+        cache.latent.push(latent);
+        cache.rope.push(rope);
+
+        match config.indexer_kinds[layer_index] {
+            IndexerKind::Full => {
+                let indexer = weights
+                    .indexer
+                    .as_ref()
+                    .expect("validated full DSA layer has indexer weights");
+                let key = self.index_key(reader, indexer, hidden, position)?;
+                cache.index_keys.push(key);
+                session.dsa_selection = self.index_selection(
+                    reader,
+                    indexer,
+                    &query_latent,
+                    hidden,
+                    &cache.index_keys,
+                    position,
+                    cancelled,
+                )?;
+            }
+            IndexerKind::Shared if position + 1 > config.index_topk => {
+                if session.dsa_selection.is_none() {
+                    return Err(Glm52CpuError::MissingDsaSelection { layer: layer_index });
+                }
+            }
+            IndexerKind::Shared => {}
+        }
+
+        let positions = session
+            .dsa_selection
+            .clone()
+            .unwrap_or_else(|| (0..=position).collect());
+        let projected = positions
+            .iter()
+            .map(|&cached_position| reader.matvec(weights.kv_b, &cache.latent[cached_position]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kv_head_size = config.query_key_nope_size + config.value_head_size;
+        let scale = 1.0 / (query_head_size as f32).sqrt();
+        let mut context = vec![0.0; config.attention_heads * config.value_head_size];
+        for head in 0..config.attention_heads {
+            check_cancelled(cancelled)?;
+            let query_offset = head * query_head_size;
+            let kv_offset = head * kv_head_size;
+            let mut scores = Vec::with_capacity(positions.len());
+            for (projected, &cached_position) in projected.iter().zip(&positions) {
+                let nope = dot(
+                    &query[query_offset..query_offset + config.query_key_nope_size],
+                    &projected[kv_offset..kv_offset + config.query_key_nope_size],
+                );
+                let rope = dot(
+                    &query
+                        [query_offset + config.query_key_nope_size..query_offset + query_head_size],
+                    &cache.rope[cached_position],
+                );
+                scores.push((nope + rope) * scale);
+            }
+            softmax_in_place(&mut scores);
+            let output_offset = head * config.value_head_size;
+            for (score, projected) in scores.iter().zip(&projected) {
+                for value in 0..config.value_head_size {
+                    context[output_offset + value] +=
+                        score * projected[kv_offset + config.query_key_nope_size + value];
+                }
+            }
+        }
+        reader.matvec(weights.attention_output, &context)
+    }
+
+    fn index_key(
+        &self,
+        reader: &TensorReader<'_>,
+        weights: &Glm52IndexerWeights,
+        hidden: &[f32],
+        position: usize,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
+        let mut key = reader.matvec(weights.key, hidden)?;
+        let norm_weight = reader.vector(weights.key_norm_weight)?;
+        let norm_bias = reader.vector(weights.key_norm_bias)?;
+        layer_norm_in_place(&mut key, &norm_weight, &norm_bias, 1e-6);
+        rope_interleaved_prefix(
+            &mut key,
+            self.config.query_key_rope_size,
+            position,
+            self.config.rope_theta,
+        );
+        Ok(key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn index_selection(
+        &self,
+        reader: &TensorReader<'_>,
+        weights: &Glm52IndexerWeights,
+        query_latent: &[f32],
+        hidden: &[f32],
+        keys: &[Vec<f32>],
+        position: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<Vec<usize>>, Glm52CpuError> {
+        if position < self.config.index_topk {
+            return Ok(None);
+        }
+        let mut query = reader.matvec(weights.query, query_latent)?;
+        for head in 0..self.config.index_heads {
+            let start = head * self.config.index_head_size;
+            rope_interleaved_prefix(
+                &mut query[start..start + self.config.index_head_size],
+                self.config.query_key_rope_size,
+                position,
+                self.config.rope_theta,
+            );
+        }
+        let head_weights = reader.matvec(weights.projection, hidden)?;
+        let head_scale = 1.0 / (self.config.index_heads as f32).sqrt();
+        let dot_scale = 1.0 / (self.config.index_head_size as f32).sqrt();
+        let mut scores = Vec::with_capacity(keys.len());
+        for (cached_position, key) in keys.iter().enumerate() {
+            check_cancelled(cancelled)?;
+            let mut score = 0.0;
+            for (head, weight) in head_weights.iter().enumerate() {
+                let start = head * self.config.index_head_size;
+                score += weight
+                    * (dot(&query[start..start + self.config.index_head_size], key) * dot_scale)
+                        .max(0.0);
+            }
+            scores.push((cached_position, score * head_scale));
+        }
+        scores.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut selected = scores
+            .into_iter()
+            .take(self.config.index_topk)
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        Ok(Some(selected))
+    }
+
+    fn feed_forward(
+        &self,
+        reader: &TensorReader<'_>,
+        layer: usize,
+        weights: &Glm52FeedForwardWeights,
+        hidden: &[f32],
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<f32>, Glm52CpuError> {
+        match weights {
+            Glm52FeedForwardWeights::Dense { gate, up, down } => {
+                mlp(reader, *gate, *up, *down, hidden)
+            }
+            Glm52FeedForwardWeights::Sparse {
+                router,
+                correction_bias,
+                shared_gate,
+                shared_up,
+                shared_down,
+                experts,
+            } => {
+                let router_logits = reader.matvec(*router, hidden)?;
+                let correction = reader.vector(*correction_bias)?;
+                let mut choices = Vec::with_capacity(experts.len());
+                for expert in 0..experts.len() {
+                    let weight = sigmoid(router_logits[expert]);
+                    let choice = weight + correction[expert];
+                    if !weight.is_finite() || !choice.is_finite() {
+                        return Err(Glm52CpuError::InvalidRouterScore { layer, expert });
+                    }
+                    choices.push((expert, choice, weight));
+                }
+                choices.sort_by(|left, right| {
+                    right
+                        .1
+                        .total_cmp(&left.1)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                choices.truncate(self.config.experts_per_token);
+                if self.config.normalize_topk {
+                    let sum = choices.iter().map(|choice| choice.2).sum::<f32>() + 1e-20;
+                    for choice in &mut choices {
+                        choice.2 /= sum;
+                    }
+                }
+                let mut output = vec![0.0; self.config.hidden_size];
+                for (expert, _, weight) in choices {
+                    check_cancelled(cancelled)?;
+                    let weights = &experts[expert];
+                    let expert_output =
+                        mlp(reader, weights.gate, weights.up, weights.down, hidden)?;
+                    for (output, value) in output.iter_mut().zip(expert_output) {
+                        *output += value * weight * self.config.routed_scale;
+                    }
+                }
+                let shared = mlp(reader, *shared_gate, *shared_up, *shared_down, hidden)?;
+                add_in_place(&mut output, &shared);
+                Ok(output)
+            }
+        }
+    }
+}
+
+impl Glm52CpuSession {
+    pub fn position(&self) -> usize {
+        self.layers.first().map_or(0, |layer| layer.latent.len())
+    }
+
+    pub const fn maximum_context(&self) -> usize {
+        self.maximum_context
+    }
+}
+
+fn mlp(
+    reader: &TensorReader<'_>,
+    gate: usize,
+    up: usize,
+    down: usize,
+    input: &[f32],
+) -> Result<Vec<f32>, Glm52CpuError> {
+    let mut gate = reader.matvec(gate, input)?;
+    let up = reader.matvec(up, input)?;
+    for (gate, up) in gate.iter_mut().zip(up) {
+        *gate = silu(*gate) * up;
+    }
+    reader.matvec(down, &gate)
+}
+
+fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
+    let mean_square = input
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        / input.len() as f64;
+    let scale = 1.0 / (mean_square as f32 + epsilon).sqrt();
+    input
+        .iter()
+        .zip(weight)
+        .map(|(value, weight)| value * scale * weight)
+        .collect()
+}
+
+fn layer_norm_in_place(values: &mut [f32], weight: &[f32], bias: &[f32], epsilon: f32) {
+    let mean = values.iter().map(|value| f64::from(*value)).sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let difference = f64::from(*value) - mean;
+            difference * difference
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    let scale = 1.0 / (variance as f32 + epsilon).sqrt();
+    for ((value, weight), bias) in values.iter_mut().zip(weight).zip(bias) {
+        *value = (*value - mean as f32) * scale * weight + bias;
+    }
+}
+
+fn rope_interleaved_prefix(values: &mut [f32], rotary: usize, position: usize, theta: f32) {
+    let input = values[..rotary].to_vec();
+    let half = rotary / 2;
+    for index in 0..half {
+        let angle = position as f32 * theta.powf(-2.0 * index as f32 / rotary as f32);
+        let (sin, cos) = angle.sin_cos();
+        let first = input[index * 2];
+        let second = input[index * 2 + 1];
+        values[index] = first * cos - second * sin;
+        values[half + index] = second * cos + first * sin;
+    }
+}
+
+fn softmax_in_place(values: &mut [f32]) {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0;
+    for value in values.iter_mut() {
+        *value = (*value - maximum).exp();
+        sum += *value;
+    }
+    for value in values {
+        *value /= sum;
+    }
+}
+
+fn dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn add_in_place(target: &mut [f32], values: &[f32]) {
+    for (target, value) in target.iter_mut().zip(values) {
+        *target += value;
+    }
+}
+
+fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+fn silu(value: f32) -> f32 {
+    value * sigmoid(value)
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), Glm52CpuError> {
+    if cancelled.load(Ordering::Relaxed) {
+        Err(Glm52CpuError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 /// Reads and computes directly from safetensors ranges without materializing a shard.
@@ -340,14 +853,16 @@ fn f16_to_f32(value: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write, path::Path};
+    use std::{fs, io::Write, path::Path, sync::atomic::AtomicBool};
 
     use serde_json::{Map, json};
     use tempfile::TempDir;
 
     use crate::safetensors::SafeTensorSource;
 
-    use super::{Glm52CpuError, TensorReader, decode_f8_e4m3fn};
+    use super::{
+        Glm52CpuError, Glm52CpuModel, TensorReader, decode_f8_e4m3fn, rope_interleaved_prefix,
+    };
 
     #[test]
     fn decodes_e4m3fn_boundaries() {
@@ -434,6 +949,78 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rotates_adjacent_pairs_into_contiguous_halves() {
+        let mut values = [1.0, 2.0, 3.0, 4.0];
+        rope_interleaved_prefix(&mut values, 4, 1, 100.0);
+        let (sin0, cos0) = 1.0_f32.sin_cos();
+        let (sin1, cos1) = 0.1_f32.sin_cos();
+        let expected = [
+            cos0 - 2.0 * sin0,
+            3.0 * cos1 - 4.0 * sin1,
+            2.0 * cos0 + sin0,
+            4.0 * cos1 + 3.0 * sin1,
+        ];
+        for (actual, expected) in values.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn executes_dense_sparse_mla_and_shared_dsa_layers() {
+        let temp = TempDir::new().unwrap();
+        write_tiny_model(temp.path());
+        let model = Glm52CpuModel::from_directory(temp.path()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut session = model.start_session(8);
+        let mut predictions = Vec::new();
+        let mut final_logits = Vec::new();
+        for token in [1, 2, 3, 4] {
+            final_logits = model
+                .forward_token(&mut session, token, &cancelled)
+                .unwrap();
+            predictions.push(argmax(&final_logits));
+        }
+        assert_eq!(session.position(), 4);
+        assert_eq!(session.layers[0].index_keys.len(), 4);
+        assert!(session.layers[1].index_keys.is_empty());
+        assert_eq!(session.dsa_selection.as_deref(), Some(&[2, 3][..]));
+        assert_eq!(predictions, [5, 9, 10, 5]);
+        assert!(
+            (final_logits[0] - (-0.129_220_81)).abs() < 1e-6,
+            "{}",
+            final_logits[0]
+        );
+
+        let mut replay = model.start_session(8);
+        let mut replay_logits = Vec::new();
+        for token in [1, 2, 3, 4] {
+            replay_logits = model.forward_token(&mut replay, token, &cancelled).unwrap();
+        }
+        assert_eq!(final_logits, replay_logits);
+    }
+
+    #[test]
+    fn cancellation_and_context_errors_do_not_advance_the_cache() {
+        let temp = TempDir::new().unwrap();
+        write_tiny_model(temp.path());
+        let model = Glm52CpuModel::from_directory(temp.path()).unwrap();
+        let cancelled = AtomicBool::new(true);
+        let mut session = model.start_session(1);
+        assert!(matches!(
+            model.forward_token(&mut session, 1, &cancelled),
+            Err(Glm52CpuError::Cancelled)
+        ));
+        assert_eq!(session.position(), 0);
+        cancelled.store(false, std::sync::atomic::Ordering::Relaxed);
+        model.forward_token(&mut session, 1, &cancelled).unwrap();
+        assert!(matches!(
+            model.forward_token(&mut session, 2, &cancelled),
+            Err(Glm52CpuError::ContextExceeded { maximum: 1 })
+        ));
+        assert_eq!(session.position(), 1);
+    }
+
     fn tensor_index(source: &SafeTensorSource, name: &str) -> usize {
         source
             .index
@@ -464,5 +1051,208 @@ mod tests {
             .unwrap();
         file.write_all(&header).unwrap();
         file.write_all(&payload).unwrap();
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    }
+
+    fn write_tiny_model(directory: &Path) {
+        fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&json!({
+                "model_type": "glm_moe_dsa",
+                "vocab_size": 16,
+                "hidden_size": 8,
+                "intermediate_size": 6,
+                "moe_intermediate_size": 3,
+                "num_hidden_layers": 2,
+                "first_k_dense_replace": 1,
+                "num_attention_heads": 2,
+                "n_routed_experts": 2,
+                "num_experts_per_tok": 1,
+                "n_shared_experts": 1,
+                "q_lora_rank": 4,
+                "kv_lora_rank": 4,
+                "qk_nope_head_dim": 2,
+                "qk_rope_head_dim": 2,
+                "v_head_dim": 2,
+                "index_topk": 2,
+                "index_head_dim": 2,
+                "index_n_heads": 2,
+                "indexer_types": ["full", "shared"],
+                "n_group": 1,
+                "topk_group": 1,
+                "norm_topk_prob": true,
+                "routed_scaling_factor": 2.5,
+                "rope_parameters": {"rope_theta": 10000.0},
+                "rms_norm_eps": 0.00001,
+                "eos_token_id": [2,3]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut tensors = Vec::new();
+        add_tensor(&mut tensors, "model.embed_tokens.weight", &[16, 8]);
+        add_tensor(&mut tensors, "lm_head.weight", &[16, 8]);
+        add_tensor(&mut tensors, "model.norm.weight", &[8]);
+        for layer in 0..2 {
+            let prefix = format!("model.layers.{layer}");
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.input_layernorm.weight"),
+                &[8],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[8],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.q_a_proj.weight"),
+                &[4, 8],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.q_a_layernorm.weight"),
+                &[4],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.q_b_proj.weight"),
+                &[8, 4],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
+                &[6, 8],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.kv_a_layernorm.weight"),
+                &[4],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.kv_b_proj.weight"),
+                &[8, 4],
+            );
+            add_tensor(
+                &mut tensors,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &[8, 4],
+            );
+            if layer == 0 {
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    &[6, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    &[6, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    &[8, 6],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.self_attn.indexer.wq_b.weight"),
+                    &[4, 4],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.self_attn.indexer.wk.weight"),
+                    &[2, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.self_attn.indexer.weights_proj.weight"),
+                    &[2, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.self_attn.indexer.k_norm.weight"),
+                    &[2],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.self_attn.indexer.k_norm.bias"),
+                    &[2],
+                );
+            } else {
+                add_tensor(&mut tensors, &format!("{prefix}.mlp.gate.weight"), &[2, 8]);
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.gate.e_score_correction_bias"),
+                    &[2],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.shared_experts.gate_proj.weight"),
+                    &[3, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.shared_experts.up_proj.weight"),
+                    &[3, 8],
+                );
+                add_tensor(
+                    &mut tensors,
+                    &format!("{prefix}.mlp.shared_experts.down_proj.weight"),
+                    &[8, 3],
+                );
+                for expert in 0..2 {
+                    for projection in ["gate", "up"] {
+                        add_tensor(
+                            &mut tensors,
+                            &format!("{prefix}.mlp.experts.{expert}.{projection}_proj.weight"),
+                            &[3, 8],
+                        );
+                    }
+                    add_tensor(
+                        &mut tensors,
+                        &format!("{prefix}.mlp.experts.{expert}.down_proj.weight"),
+                        &[8, 3],
+                    );
+                }
+            }
+        }
+        write_safetensors(
+            &directory.join("model.safetensors"),
+            &tensors
+                .iter()
+                .map(|(name, shape)| {
+                    let count = shape.iter().product::<u64>() as usize;
+                    let seed = name.bytes().fold(0_u32, |sum, byte| sum + u32::from(byte));
+                    let values = (0..count)
+                        .map(|index| {
+                            if name.contains("layernorm") || name == "model.norm.weight" {
+                                0.9 + ((seed as usize + index * 7) % 9) as f32 * 0.025
+                            } else if name.ends_with("e_score_correction_bias") {
+                                if index == 0 { 0.1 } else { -0.1 }
+                            } else {
+                                ((seed as usize + index * 17) % 29) as f32 * 0.0125 - 0.175
+                            }
+                        })
+                        .flat_map(f32::to_le_bytes)
+                        .collect::<Vec<_>>();
+                    (name.as_str(), "F32", shape.clone(), values)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    fn add_tensor(tensors: &mut Vec<(String, Vec<u64>)>, name: &str, shape: &[u64]) {
+        tensors.push((name.to_owned(), shape.to_vec()));
     }
 }

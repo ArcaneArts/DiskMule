@@ -231,6 +231,13 @@ impl Glm52Config {
                 "interleaved RoPE dimensions must be even",
             ));
         }
+        if raw.index_head_dim < raw.qk_rope_head_dim {
+            return Err(invalid(
+                "index_head_dim",
+                raw.index_head_dim,
+                "must be at least qk_rope_head_dim",
+            ));
+        }
         for (field, value) in [
             ("rms_norm_eps", raw.rms_norm_eps),
             ("rope_theta", raw.rope_parameters.rope_theta),
