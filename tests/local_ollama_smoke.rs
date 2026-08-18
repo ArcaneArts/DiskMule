@@ -10,7 +10,8 @@ use tempfile::TempDir;
 
 use diskmule::{
     gemma4::{
-        ChatMessage, ChatRole, Gemma4Config, Gemma4Tokenizer, RUNTIME_ARRAY_KEYS, render_chat,
+        ChatMessage, ChatRole, Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS,
+        render_chat,
     },
     gguf::TensorSource,
 };
@@ -56,6 +57,27 @@ fn installed_gemma_is_listed_inspected_and_protected() {
             .filter(|value| !**value)
             .count(),
         5
+    );
+    let weights = Gemma4Weights::from_gguf(&source.gguf, &config).unwrap();
+    assert_eq!(weights.layers.len(), 30);
+    assert!(weights.tied_output);
+    assert_eq!(weights.output, weights.token_embedding);
+    assert_eq!(
+        weights
+            .layers
+            .iter()
+            .filter(|layer| layer.attention_value.is_none())
+            .count(),
+        5
+    );
+    for layer in [5, 11, 17, 23, 29] {
+        assert!(weights.layers[layer].attention_value.is_none());
+    }
+    assert_eq!(
+        weights
+            .tensor(&source.gguf, weights.layers[0].expert_gate_up)
+            .dimensions,
+        [2_816, 1_408, 128]
     );
     let tokenizer = Gemma4Tokenizer::take_from_gguf(&mut source.gguf).unwrap();
     assert_eq!(tokenizer.vocab_size(), 262_144);

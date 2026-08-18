@@ -2,7 +2,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::gguf::{GgufFile, MetadataArray, MetadataValue};
+use crate::gguf::{GgufFile, MetadataArray, MetadataValue, TensorInfo};
 
 pub const RUNTIME_ARRAY_KEYS: [&str; 6] = [
     "gemma4.attention.head_count_kv",
@@ -53,6 +53,19 @@ pub enum Gemma4Error {
 
     #[error("chat system message must be first")]
     SystemMessageOrder,
+
+    #[error("missing Gemma 4 tensor {0:?}")]
+    MissingTensor(String),
+
+    #[error("Gemma 4 tensor {tensor:?} has shape {actual:?}; expected {expected:?}")]
+    TensorShape {
+        tensor: String,
+        expected: Vec<u64>,
+        actual: Vec<u64>,
+    },
+
+    #[error("Gemma 4 full-attention layer {layer} must derive V from K, but {tensor:?} exists")]
+    UnexpectedValueTensor { layer: usize, tensor: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +212,206 @@ impl Gemma4Config {
         }
         Ok(())
     }
+}
+
+/// Indices for the text tower's tensors in a parsed GGUF index.
+///
+/// Keeping indices instead of borrowing tensor descriptors lets the runtime
+/// own this validated map alongside a [`crate::gguf::TensorSource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4Weights {
+    pub token_embedding: usize,
+    pub output_norm: usize,
+    pub output: usize,
+    pub tied_output: bool,
+    pub layers: Vec<Gemma4LayerWeights>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gemma4LayerWeights {
+    pub attention_norm: usize,
+    pub attention_query: usize,
+    pub attention_key: usize,
+    pub attention_value: Option<usize>,
+    pub attention_output: usize,
+    pub query_norm: usize,
+    pub key_norm: usize,
+    pub post_attention_norm: usize,
+    pub feed_forward_norm: usize,
+    pub feed_forward_gate: usize,
+    pub feed_forward_up: usize,
+    pub feed_forward_down: usize,
+    pub post_feed_forward_norm: usize,
+    pub routed_pre_norm: usize,
+    pub routed_post_norm: usize,
+    pub router: usize,
+    pub router_scale: usize,
+    pub expert_gate_up: usize,
+    pub expert_down: usize,
+    pub expert_down_scale: usize,
+    pub layer_output_scale: usize,
+}
+
+impl Gemma4Weights {
+    /// Validate and bind the complete Gemma 4 text-tower tensor contract.
+    pub fn from_gguf(gguf: &GgufFile, config: &Gemma4Config) -> Result<Self, Gemma4Error> {
+        let hidden = u64::from(config.hidden_size);
+        let vocabulary = required_array_length(gguf, "tokenizer.ggml.tokens")?;
+        let token_embedding = required_tensor(gguf, "token_embd.weight", &[hidden, vocabulary])?;
+        let output_norm = required_tensor(gguf, "output_norm.weight", &[hidden])?;
+        let (output, tied_output) = match tensor_index(gguf, "output.weight") {
+            Some(index) => {
+                validate_shape(gguf, index, &[hidden, vocabulary])?;
+                (index, false)
+            }
+            None => (token_embedding, true),
+        };
+
+        let mut layers = Vec::with_capacity(config.layer_count as usize);
+        for layer in 0..config.layer_count as usize {
+            let sliding = config.sliding_layers[layer];
+            let head_dimension = if sliding {
+                u64::from(config.key_length_swa)
+            } else {
+                u64::from(config.key_length)
+            };
+            let attention_width = u64::from(config.attention_heads) * head_dimension;
+            let kv_width = u64::from(config.kv_heads_by_layer[layer]) * head_dimension;
+            let prefix = format!("blk.{layer}");
+            let name = |suffix: &str| format!("{prefix}.{suffix}");
+
+            let value_name = name("attn_v.weight");
+            let attention_value = if sliding {
+                Some(required_tensor(gguf, &value_name, &[hidden, kv_width])?)
+            } else if tensor_index(gguf, &value_name).is_some() {
+                return Err(Gemma4Error::UnexpectedValueTensor {
+                    layer,
+                    tensor: value_name,
+                });
+            } else {
+                None
+            };
+
+            layers.push(Gemma4LayerWeights {
+                attention_norm: required_tensor(gguf, &name("attn_norm.weight"), &[hidden])?,
+                attention_query: required_tensor(
+                    gguf,
+                    &name("attn_q.weight"),
+                    &[hidden, attention_width],
+                )?,
+                attention_key: required_tensor(gguf, &name("attn_k.weight"), &[hidden, kv_width])?,
+                attention_value,
+                attention_output: required_tensor(
+                    gguf,
+                    &name("attn_output.weight"),
+                    &[attention_width, hidden],
+                )?,
+                query_norm: required_tensor(gguf, &name("attn_q_norm.weight"), &[head_dimension])?,
+                key_norm: required_tensor(gguf, &name("attn_k_norm.weight"), &[head_dimension])?,
+                post_attention_norm: required_tensor(
+                    gguf,
+                    &name("post_attention_norm.weight"),
+                    &[hidden],
+                )?,
+                feed_forward_norm: required_tensor(gguf, &name("ffn_norm.weight"), &[hidden])?,
+                feed_forward_gate: required_tensor(
+                    gguf,
+                    &name("ffn_gate.weight"),
+                    &[hidden, u64::from(config.feed_forward_length)],
+                )?,
+                feed_forward_up: required_tensor(
+                    gguf,
+                    &name("ffn_up.weight"),
+                    &[hidden, u64::from(config.feed_forward_length)],
+                )?,
+                feed_forward_down: required_tensor(
+                    gguf,
+                    &name("ffn_down.weight"),
+                    &[u64::from(config.feed_forward_length), hidden],
+                )?,
+                post_feed_forward_norm: required_tensor(
+                    gguf,
+                    &name("post_ffw_norm.weight"),
+                    &[hidden],
+                )?,
+                routed_pre_norm: required_tensor(gguf, &name("pre_ffw_norm_2.weight"), &[hidden])?,
+                routed_post_norm: required_tensor(
+                    gguf,
+                    &name("post_ffw_norm_2.weight"),
+                    &[hidden],
+                )?,
+                router: required_tensor(
+                    gguf,
+                    &name("ffn_gate_inp.weight"),
+                    &[hidden, u64::from(config.expert_count)],
+                )?,
+                router_scale: required_tensor(gguf, &name("ffn_gate_inp.scale"), &[hidden])?,
+                expert_gate_up: required_tensor(
+                    gguf,
+                    &name("ffn_gate_up_exps.weight"),
+                    &[
+                        hidden,
+                        2 * u64::from(config.expert_feed_forward_length),
+                        u64::from(config.expert_count),
+                    ],
+                )?,
+                expert_down: required_tensor(
+                    gguf,
+                    &name("ffn_down_exps.weight"),
+                    &[
+                        u64::from(config.expert_feed_forward_length),
+                        hidden,
+                        u64::from(config.expert_count),
+                    ],
+                )?,
+                expert_down_scale: required_tensor(
+                    gguf,
+                    &name("ffn_down_exps.scale"),
+                    &[u64::from(config.expert_count)],
+                )?,
+                layer_output_scale: required_tensor(
+                    gguf,
+                    &name("layer_output_scale.weight"),
+                    &[1],
+                )?,
+            });
+        }
+
+        Ok(Self {
+            token_embedding,
+            output_norm,
+            output,
+            tied_output,
+            layers,
+        })
+    }
+
+    pub fn tensor<'a>(&self, gguf: &'a GgufFile, index: usize) -> &'a TensorInfo {
+        &gguf.tensors[index]
+    }
+}
+
+fn required_tensor(gguf: &GgufFile, name: &str, dimensions: &[u64]) -> Result<usize, Gemma4Error> {
+    let index =
+        tensor_index(gguf, name).ok_or_else(|| Gemma4Error::MissingTensor(name.to_owned()))?;
+    validate_shape(gguf, index, dimensions)?;
+    Ok(index)
+}
+
+fn tensor_index(gguf: &GgufFile, name: &str) -> Option<usize> {
+    gguf.tensors.iter().position(|tensor| tensor.name == name)
+}
+
+fn validate_shape(gguf: &GgufFile, index: usize, expected: &[u64]) -> Result<(), Gemma4Error> {
+    let tensor = &gguf.tensors[index];
+    if tensor.dimensions != expected {
+        return Err(Gemma4Error::TensorShape {
+            tensor: tensor.name.clone(),
+            expected: expected.to_vec(),
+            actual: tensor.dimensions.clone(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,6 +858,14 @@ fn required_bool(gguf: &GgufFile, key: &'static str) -> Result<bool, Gemma4Error
     required(gguf, key)?
         .as_bool()
         .ok_or_else(|| wrong_type(key, "BOOL"))
+}
+
+fn required_array_length(gguf: &GgufFile, key: &'static str) -> Result<u64, Gemma4Error> {
+    match required(gguf, key)? {
+        MetadataValue::Array { length, .. } => Ok(*length),
+        MetadataValue::ArrayValues(values) => Ok(values.len() as u64),
+        _ => Err(wrong_type(key, "array")),
+    }
 }
 
 fn required_i32_array<'a>(gguf: &'a GgufFile, key: &'static str) -> Result<&'a [i32], Gemma4Error> {
