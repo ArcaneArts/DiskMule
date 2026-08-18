@@ -1,6 +1,8 @@
 //! Qwen3.5/Qwen3.8 hybrid recurrent-attention architecture contract.
 
 pub mod cpu;
+#[cfg(target_os = "macos")]
+pub mod metal;
 pub mod tokenizer;
 
 use crate::gguf::{GgufFile, MetadataValue, TensorType};

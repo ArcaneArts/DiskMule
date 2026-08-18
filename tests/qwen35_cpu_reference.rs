@@ -93,6 +93,33 @@ fn hybrid_session_reuses_extensions_and_rebuilds_divergent_prompts() {
     assert!(session.cached_tokens().is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_matrix_offload_matches_the_scalar_hybrid_graph() {
+    let fixture = TinyQwen::write();
+    let cpu = Qwen35CpuModel::open(&fixture.path, 16).unwrap();
+    let metal = Qwen35CpuModel::open_metal(&fixture.path, 16).unwrap();
+    assert!(metal.backend_label().starts_with("Metal ("));
+    let cancellation = CancellationFlag::default();
+    let (cpu_logits, _) = cpu.prompt_logits(&[0, 1, 2], &cancellation).unwrap();
+    let (metal_logits, _) = metal.prompt_logits(&[0, 1, 2], &cancellation).unwrap();
+    let maximum_error = cpu_logits
+        .iter()
+        .zip(&metal_logits)
+        .map(|(cpu, metal)| (cpu - metal).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(maximum_error < 1e-5, "maximum logit error: {maximum_error}");
+    let cpu_tokens = cpu
+        .generate_greedy(&[0, 1], 3, &cancellation, |_, _| {})
+        .unwrap()
+        .token_ids;
+    let metal_tokens = metal
+        .generate_greedy(&[0, 1], 3, &cancellation, |_, _| {})
+        .unwrap()
+        .token_ids;
+    assert_eq!(metal_tokens, cpu_tokens);
+}
+
 struct TinyQwen {
     _directory: TempDir,
     path: std::path::PathBuf,

@@ -1,16 +1,19 @@
 use std::{env, fs, path::Path, path::PathBuf, process::Command};
 
 use diskmule::{
-    gemma4::{ChatMessage, ChatRole},
+    gemma4::{ChatMessage, ChatRole, cpu::CancellationFlag},
     gguf::TensorSource,
     qwen35::{
         Qwen35Config, Qwen35Weights, RUNTIME_ARRAY_KEYS,
+        cpu::Qwen35CpuModel,
         tokenizer::{Qwen35Tokenizer, render_chat},
     },
 };
 use serde::Deserialize;
 
 const MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
+const EXPECTED_MODEL_DIGEST: &str =
+    "sha256:f5f1dd8920d417aac2718b0bda3403da274301efdd6760b4f0f4b864ff2ad57d";
 
 #[derive(Deserialize)]
 struct Manifest {
@@ -70,6 +73,44 @@ fn installed_qwen35_contract_and_tokenizer_match_llama_cpp() {
     if let Some(expected) = reference_tokenize(&blob, &chat) {
         assert_eq!(tokenizer.encode(&chat).unwrap(), expected);
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires the pinned 16 GB qwen3.8 model and a full Metal hybrid forward pass"]
+fn greedy_metal_decode_matches_the_local_ollama_reference() {
+    let Some(root) = ollama_root() else {
+        eprintln!("skipping: Ollama model root is unavailable");
+        return;
+    };
+    let manifest_path = root.join("manifests/registry.ollama.ai/library/qwen3.8/latest");
+    if !manifest_path.is_file() {
+        eprintln!("skipping: qwen3.8:latest is not installed");
+        return;
+    }
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let layer = manifest
+        .layers
+        .iter()
+        .find(|layer| layer.media_type == MODEL_MEDIA_TYPE)
+        .unwrap();
+    if layer.digest != EXPECTED_MODEL_DIGEST {
+        eprintln!("skipping: local qwen3.8 digest differs from the pinned oracle");
+        return;
+    }
+    let blob = root
+        .join("blobs")
+        .join(EXPECTED_MODEL_DIGEST.replacen(':', "-", 1));
+    let model = Qwen35CpuModel::open_metal(blob, 8).unwrap();
+    let prompt = model.tokenizer.encode("Hi").unwrap();
+    assert_eq!(prompt, [12_675]);
+    let result = model
+        .generate_greedy(&prompt, 4, &CancellationFlag::default(), |_, _| {})
+        .unwrap();
+    eprintln!("DiskMule Qwen token IDs: {:?}", result.token_ids);
+    eprintln!("DiskMule Qwen profile: {:#?}", result.profile);
+    assert_eq!(result.token_ids, [11, 353, 2_688, 264]);
+    assert_eq!(result.text, ", I'm a");
 }
 
 fn reference_tokenize(model: &Path, prompt: &str) -> Option<Vec<u32>> {

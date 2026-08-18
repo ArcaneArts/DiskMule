@@ -22,6 +22,8 @@ pub struct Qwen35CpuModel {
     pub tokenizer: Qwen35Tokenizer,
     pub weights: Qwen35Weights,
     max_context: usize,
+    #[cfg(target_os = "macos")]
+    metal: Option<crate::qwen35::metal::Qwen35MetalWeights>,
 }
 
 #[derive(Debug)]
@@ -54,6 +56,26 @@ enum Qwen35LayerState {
 impl Qwen35CpuModel {
     pub fn open(path: impl AsRef<Path>, max_context: usize) -> Result<Self, RuntimeError> {
         let source = TensorSource::open_with_arrays(path, RUNTIME_ARRAY_KEYS)?;
+        Self::from_source(
+            source,
+            max_context,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn open_metal(path: impl AsRef<Path>, max_context: usize) -> Result<Self, RuntimeError> {
+        let source = TensorSource::open_with_arrays(path, RUNTIME_ARRAY_KEYS)?;
+        let metal = crate::qwen35::metal::Qwen35MetalWeights::new(&source)?;
+        Self::from_source(source, max_context, Some(metal))
+    }
+
+    fn from_source(
+        source: TensorSource,
+        max_context: usize,
+        #[cfg(target_os = "macos")] metal: Option<crate::qwen35::metal::Qwen35MetalWeights>,
+    ) -> Result<Self, RuntimeError> {
         let config = Qwen35Config::from_gguf(&source.gguf)?;
         let weights = Qwen35Weights::from_gguf(&source.gguf, &config)?;
         let tokenizer = Qwen35Tokenizer::from_gguf(&source.gguf)?;
@@ -70,7 +92,17 @@ impl Qwen35CpuModel {
             tokenizer,
             weights,
             max_context,
+            #[cfg(target_os = "macos")]
+            metal,
         })
+    }
+
+    pub fn backend_label(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            return format!("Metal ({})", metal.device_name());
+        }
+        "CPU".to_owned()
     }
 
     pub fn source(&self) -> &TensorSource {
@@ -570,7 +602,9 @@ impl Qwen35CpuModel {
             }
             convolved[channel] = projected_qkv[channel]
                 .mul_add(convolution_weights[channel * kernel + kernel - 1], sum);
-            convolved[channel] = silu(convolved[channel]);
+        }
+        for value in &mut convolved {
+            *value = silu(*value);
         }
         if kernel > 1 {
             if kernel > 2 {
@@ -685,6 +719,23 @@ impl Qwen35CpuModel {
         output: &mut [f32],
         profile: &mut GenerationProfile,
     ) -> Result<(), RuntimeError> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = &self.metal {
+            let tensor = &self.source.gguf.tensors[index];
+            if input.iter().any(|value| !value.is_finite()) {
+                return Err(RuntimeError::NonFiniteMetalInput {
+                    tensor: format!("{} ({})", tensor.name, tensor.kind.name()),
+                });
+            }
+            metal.matvec(&self.source, index, input, output)?;
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err(RuntimeError::NonFiniteMetalTensor {
+                    tensor: format!("{} ({})", tensor.name, tensor.kind.name()),
+                });
+            }
+            self.touch(index, profile);
+            return Ok(());
+        }
         tensor_matvec(&self.source, index, input, output)?;
         self.touch(index, profile);
         Ok(())
@@ -801,10 +852,10 @@ fn gated_delta_update(input: GatedDeltaInput<'_>, state: &mut [f32], output: &mu
         value_heads,
         head_size,
     } = input;
-    let repetitions = value_heads / key_heads;
     let query_scale = (head_size as f32).sqrt().recip();
     for value_head in 0..value_heads {
-        let key_head = value_head / repetitions;
+        // GGML's fused GDN broadcasts key heads cyclically (`h_v % h_k`).
+        let key_head = value_head % key_heads;
         let query = &queries[key_head * head_size..(key_head + 1) * head_size];
         let key = &keys[key_head * head_size..(key_head + 1) * head_size];
         let value = &values[value_head * head_size..(value_head + 1) * head_size];
@@ -949,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_key_heads_repeat_contiguously() {
+    fn recurrent_key_heads_repeat_cyclically_like_ggml() {
         let mut state = vec![0.0; 4];
         let mut output = vec![0.0; 4];
         gated_delta_update(
@@ -966,7 +1017,7 @@ mod tests {
             &mut state,
             &mut output,
         );
-        assert_eq!(output, [1.0, 2.0, 6.0, 8.0]);
+        assert_eq!(output, [1.0, 4.0, 3.0, 8.0]);
     }
 
     #[test]
