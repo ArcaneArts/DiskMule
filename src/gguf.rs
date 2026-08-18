@@ -610,7 +610,7 @@ impl GgufFile {
 pub struct TensorSource {
     path: PathBuf,
     file: Arc<File>,
-    mapping: Mmap,
+    mapping: Arc<Mmap>,
     pub gguf: GgufFile,
     tensor_indices: HashMap<String, usize>,
 }
@@ -638,7 +638,7 @@ impl TensorSource {
         // SAFETY: the descriptor is opened read-only and retained for the
         // complete lifetime of the immutable mapping. DiskMule never mutates
         // external model files.
-        let mapping = unsafe { MmapOptions::new().map(&file)? };
+        let mapping = Arc::new(unsafe { MmapOptions::new().map(&file)? });
         let file = Arc::new(file);
         let tensor_indices = gguf
             .tensors
@@ -657,6 +657,11 @@ impl TensorSource {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Share the immutable whole-file mapping with a lifetime-owning backend.
+    pub fn shared_mapping(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mapping)
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {

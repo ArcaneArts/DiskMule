@@ -99,6 +99,16 @@ pub enum MetalError {
     #[error("top-k count {k} is outside 1..={length}")]
     InvalidTopK { k: usize, length: usize },
 
+    #[error("mapped buffer address {address:#x} is not aligned to its {page_size}-byte host page")]
+    MappedBufferAlignment { address: usize, page_size: usize },
+
+    #[error("mapped buffer range {offset}..{end} exceeds its {length}-byte file mapping")]
+    MappedRange {
+        offset: usize,
+        end: usize,
+        length: usize,
+    },
+
     #[error("could not create a Metal command buffer or compute encoder")]
     CommandEncoding,
 
@@ -113,9 +123,11 @@ mod implementation {
         ffi::c_void,
         ptr::NonNull,
         slice,
+        sync::Arc,
     };
 
     use block2::RcBlock;
+    use memmap2::Mmap;
     use objc2::{rc::Retained, runtime::ProtocolObject};
     use objc2_foundation::NSString;
     use objc2_metal::{
@@ -173,6 +185,22 @@ mod implementation {
         top_k_softmax: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     }
 
+    #[derive(Debug)]
+    pub struct MetalMappedBuffer {
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        mapping: Arc<Mmap>,
+    }
+
+    impl MetalMappedBuffer {
+        pub fn len(&self) -> usize {
+            self.mapping.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.mapping.is_empty()
+        }
+    }
+
     impl MetalContext {
         pub fn new() -> Result<Self, MetalError> {
             let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
@@ -223,6 +251,48 @@ mod implementation {
 
         pub fn device_name(&self) -> String {
             self.device.name().to_string()
+        }
+
+        /// Wrap an immutable file mapping without copying it. The returned
+        /// object retains the mapping until Metal releases its buffer view.
+        pub fn map_read_only(&self, mapping: Arc<Mmap>) -> Result<MetalMappedBuffer, MetalError> {
+            let page_size = host_page_size()?;
+            let address = mapping.as_ptr() as usize;
+            if !address.is_multiple_of(page_size) {
+                return Err(MetalError::MappedBufferAlignment { address, page_size });
+            }
+            let mapped_length = mapping.len();
+            if mapped_length == 0 {
+                return Err(MetalError::BufferAllocation { bytes: 0 });
+            }
+            let buffer_length = mapped_length
+                .checked_add(page_size - 1)
+                .map(|rounded| rounded / page_size * page_size)
+                .ok_or(MetalError::BufferAllocation {
+                    bytes: mapped_length,
+                })?;
+            let pointer = NonNull::new(mapping.as_ptr().cast_mut().cast::<c_void>()).ok_or(
+                MetalError::BufferAllocation {
+                    bytes: mapped_length,
+                },
+            )?;
+            // SAFETY: memmap2 creates a host-page-aligned mapping. The final
+            // virtual page is mapped even when the file ends partway through
+            // it, and every dispatch is range-checked against `mapped_length`.
+            // The returned wrapper retains the mapping beyond the MTLBuffer.
+            let buffer = unsafe {
+                self.device
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        pointer,
+                        buffer_length,
+                        MTLResourceOptions::StorageModeShared,
+                        None,
+                    )
+            }
+            .ok_or(MetalError::BufferAllocation {
+                bytes: mapped_length,
+            })?;
+            Ok(MetalMappedBuffer { buffer, mapping })
         }
 
         pub fn add(
@@ -454,43 +524,8 @@ mod implementation {
             input: &[f32],
             output: &mut [f32],
         ) -> Result<(), MetalError> {
-            if input.len() != columns {
-                return Err(MetalError::InvalidInputLength {
-                    expected: columns,
-                    actual: input.len(),
-                });
-            }
-            if output.len() != rows {
-                return Err(MetalError::InvalidOutputLength {
-                    expected: rows,
-                    actual: output.len(),
-                });
-            }
-            let pipeline = match kind {
-                TensorType::F32 => &self.matvec_f32,
-                TensorType::F16 => &self.matvec_f16,
-                TensorType::Q5_0 => &self.matvec_q5_0,
-                TensorType::Q8_0 => &self.matvec_q8_0,
-                TensorType::Q4K => &self.matvec_q4_k,
-                TensorType::Q6K => &self.matvec_q6_k,
-                _ => return Err(MetalError::UnsupportedTensorType(kind.name())),
-            };
-            let row_bytes = kind
-                .row_byte_len(u64::try_from(columns).map_err(|_| MetalError::Overflow)?)
-                .ok_or(MetalError::InvalidElementCount {
-                    kind: kind.name(),
-                    elements: columns,
-                    block_elements: kind.block_elements(),
-                })?;
-            let row_bytes = usize::try_from(row_bytes).map_err(|_| MetalError::Overflow)?;
-            let matrix_bytes = rows.checked_mul(row_bytes).ok_or(MetalError::Overflow)?;
-            if encoded.len() != matrix_bytes {
-                return Err(MetalError::InvalidByteLength {
-                    kind: kind.name(),
-                    expected: matrix_bytes,
-                    actual: encoded.len(),
-                });
-            }
+            let (pipeline, row_bytes) =
+                self.prepare_matvec(kind, rows, columns, encoded.len(), input, output)?;
             if rows == 0 {
                 return Ok(());
             }
@@ -505,6 +540,57 @@ mod implementation {
                 pipeline,
                 &[
                     &encoded_buffer,
+                    &input_buffer,
+                    &output_buffer,
+                    &columns_buffer,
+                    &row_bytes_buffer,
+                ],
+                rows,
+                rows.min(REDUCTION_THREADS),
+            )?;
+            copy_buffer(&output_buffer, output);
+            Ok(())
+        }
+
+        /// Execute GEMV directly from a retained whole-file mapping.
+        #[allow(clippy::too_many_arguments)]
+        pub fn matvec_mapped(
+            &self,
+            kind: TensorType,
+            rows: usize,
+            columns: usize,
+            mapping: &MetalMappedBuffer,
+            encoded_offset: usize,
+            encoded_length: usize,
+            input: &[f32],
+            output: &mut [f32],
+        ) -> Result<(), MetalError> {
+            let (pipeline, row_bytes) =
+                self.prepare_matvec(kind, rows, columns, encoded_length, input, output)?;
+            let end = encoded_offset
+                .checked_add(encoded_length)
+                .ok_or(MetalError::Overflow)?;
+            if end > mapping.len() {
+                return Err(MetalError::MappedRange {
+                    offset: encoded_offset,
+                    end,
+                    length: mapping.len(),
+                });
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            require_nonempty("matvec", input)?;
+
+            let input_buffer = self.buffer_with_data(input)?;
+            let output_buffer = self.empty_buffer::<f32>(output.len())?;
+            let columns_buffer = self.buffer_with_data(&[count_u32(columns)?])?;
+            let row_bytes_buffer = self.buffer_with_data(&[count_u32(row_bytes)?])?;
+            self.execute_with_first_offset(
+                pipeline,
+                &mapping.buffer,
+                encoded_offset,
+                &[
                     &input_buffer,
                     &output_buffer,
                     &columns_buffer,
@@ -671,6 +757,55 @@ mod implementation {
                 .collect())
         }
 
+        fn prepare_matvec(
+            &self,
+            kind: TensorType,
+            rows: usize,
+            columns: usize,
+            encoded_length: usize,
+            input: &[f32],
+            output: &[f32],
+        ) -> Result<(&ProtocolObject<dyn MTLComputePipelineState>, usize), MetalError> {
+            if input.len() != columns {
+                return Err(MetalError::InvalidInputLength {
+                    expected: columns,
+                    actual: input.len(),
+                });
+            }
+            if output.len() != rows {
+                return Err(MetalError::InvalidOutputLength {
+                    expected: rows,
+                    actual: output.len(),
+                });
+            }
+            let pipeline = match kind {
+                TensorType::F32 => &*self.matvec_f32,
+                TensorType::F16 => &*self.matvec_f16,
+                TensorType::Q5_0 => &*self.matvec_q5_0,
+                TensorType::Q8_0 => &*self.matvec_q8_0,
+                TensorType::Q4K => &*self.matvec_q4_k,
+                TensorType::Q6K => &*self.matvec_q6_k,
+                _ => return Err(MetalError::UnsupportedTensorType(kind.name())),
+            };
+            let row_bytes = kind
+                .row_byte_len(u64::try_from(columns).map_err(|_| MetalError::Overflow)?)
+                .ok_or(MetalError::InvalidElementCount {
+                    kind: kind.name(),
+                    elements: columns,
+                    block_elements: kind.block_elements(),
+                })?;
+            let row_bytes = usize::try_from(row_bytes).map_err(|_| MetalError::Overflow)?;
+            let matrix_bytes = rows.checked_mul(row_bytes).ok_or(MetalError::Overflow)?;
+            if encoded_length != matrix_bytes {
+                return Err(MetalError::InvalidByteLength {
+                    kind: kind.name(),
+                    expected: matrix_bytes,
+                    actual: encoded_length,
+                });
+            }
+            Ok((pipeline, row_bytes))
+        }
+
         fn execute(
             &self,
             pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -690,6 +825,55 @@ mod implementation {
                 // SAFETY: callers retain every buffer until this synchronous
                 // execution completes, and every binding uses a zero offset.
                 unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index) };
+            }
+            encoder.dispatchThreads_threadsPerThreadgroup(
+                MTLSize {
+                    width: grid_width,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: threadgroup_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.endEncoding();
+            command_buffer.commit();
+            command_buffer.waitUntilCompleted();
+            if command_buffer.status() == MTLCommandBufferStatus::Error {
+                return Err(MetalError::Command(command_buffer.error().map_or_else(
+                    || "unknown command-buffer error".to_owned(),
+                    |error| error.to_string(),
+                )));
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn execute_with_first_offset(
+            &self,
+            pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+            first: &ProtocolObject<dyn MTLBuffer>,
+            first_offset: usize,
+            remaining: &[&ProtocolObject<dyn MTLBuffer>],
+            grid_width: usize,
+            threadgroup_width: usize,
+        ) -> Result<(), MetalError> {
+            let command_buffer = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalError::CommandEncoding)?;
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::CommandEncoding)?;
+            encoder.setComputePipelineState(pipeline);
+            // SAFETY: the mapped range and offset are checked by the caller,
+            // and every buffer remains retained through synchronous completion.
+            unsafe { encoder.setBuffer_offset_atIndex(Some(first), first_offset, 0) };
+            for (index, buffer) in remaining.iter().enumerate() {
+                // SAFETY: all remaining buffers are retained and bound at zero.
+                unsafe { encoder.setBuffer_offset_atIndex(Some(buffer), 0, index + 1) };
             }
             encoder.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -860,6 +1044,9 @@ mod implementation {
 
     #[cfg(test)]
     mod tests {
+        use std::{io::Write, sync::Arc};
+
+        use memmap2::MmapOptions;
         use objc2_metal::MTLBuffer;
 
         use crate::{cpu, gguf::TensorType};
@@ -1107,6 +1294,39 @@ mod implementation {
         }
 
         #[test]
+        fn mapped_matvec_reads_a_nonzero_file_offset_without_copying() {
+            let context = MetalContext::new().unwrap();
+            let encoded: Vec<_> = [1.0_f32, 2.0, 3.0, 4.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let offset = 32;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&vec![0_u8; offset]).unwrap();
+            file.write_all(&encoded).unwrap();
+            file.flush().unwrap();
+            // SAFETY: the temporary file is not mutated while this immutable
+            // mapping and its retained Metal view are alive.
+            let mapping = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+            let mapped = context.map_read_only(mapping).unwrap();
+            assert!(!mapped.is_empty());
+            let mut output = [0.0; 2];
+            context
+                .matvec_mapped(
+                    TensorType::F32,
+                    2,
+                    2,
+                    &mapped,
+                    offset,
+                    encoded.len(),
+                    &[0.5, -1.0],
+                    &mut output,
+                )
+                .unwrap();
+            assert_eq!(output, [-1.5, -2.5]);
+        }
+
+        #[test]
         fn grouped_sliding_attention_matches_the_cpu_reference() {
             let context = MetalContext::new().unwrap();
             let query: [f32; 8] = [1.0, -0.5, 0.25, 0.75, -0.5, 1.0, 0.6, -0.2];
@@ -1152,7 +1372,7 @@ mod implementation {
 }
 
 #[cfg(target_os = "macos")]
-pub use implementation::MetalContext;
+pub use implementation::{MetalContext, MetalMappedBuffer};
 
 #[cfg(not(target_os = "macos"))]
 #[derive(Debug)]

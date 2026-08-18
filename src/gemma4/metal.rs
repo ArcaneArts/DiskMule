@@ -6,7 +6,7 @@ use crate::{
     cpu::{tensor_row, tensor_vector},
     gemma4::{Gemma4Config, Gemma4Tokenizer, Gemma4Weights, RUNTIME_ARRAY_KEYS},
     gguf::TensorSource,
-    metal::MetalContext,
+    metal::{MetalContext, MetalMappedBuffer},
 };
 
 use super::cpu::{CancellationFlag, GenerationProfile, GenerationResult, KvCache, RuntimeError};
@@ -18,6 +18,7 @@ pub struct Gemma4MetalModel {
     pub tokenizer: Gemma4Tokenizer,
     pub weights: Gemma4Weights,
     metal: MetalContext,
+    mapped_weights: MetalMappedBuffer,
     max_context: usize,
     full_rope_pairs: usize,
 }
@@ -49,12 +50,14 @@ impl Gemma4MetalModel {
             });
         }
         let metal = MetalContext::new()?;
+        let mapped_weights = metal.map_read_only(source.shared_mapping())?;
         Ok(Self {
             source,
             config,
             tokenizer,
             weights,
             metal,
+            mapped_weights,
             max_context,
             full_rope_pairs,
         })
@@ -508,16 +511,13 @@ impl Gemma4MetalModel {
                 tensor: format!("{} ({})", tensor.name, tensor.kind.name()),
             });
         }
-        self.metal.matvec(
+        self.metal.matvec_mapped(
             tensor.kind,
             dimension(tensor.dimensions[1])?,
             dimension(tensor.dimensions[0])?,
-            self.source.tensor_bytes_by_index(index).ok_or(
-                crate::cpu::CpuError::InvalidTensorIndex {
-                    index,
-                    count: self.source.gguf.tensors.len(),
-                },
-            )?,
+            &self.mapped_weights,
+            dimension(tensor.absolute_offset)?,
+            dimension(tensor.byte_len)?,
             input,
             output,
         )?;
@@ -566,17 +566,16 @@ impl Gemma4MetalModel {
         let start = expert
             .checked_mul(expert_bytes)
             .ok_or(crate::metal::MetalError::Overflow)?;
-        let bytes = self.source.tensor_bytes_by_index(index).ok_or(
-            crate::cpu::CpuError::InvalidTensorIndex {
-                index,
-                count: self.source.gguf.tensors.len(),
-            },
-        )?;
-        self.metal.matvec(
+        let absolute_offset = dimension(tensor.absolute_offset)?
+            .checked_add(start)
+            .ok_or(crate::metal::MetalError::Overflow)?;
+        self.metal.matvec_mapped(
             tensor.kind,
             rows,
             columns,
-            &bytes[start..start + expert_bytes],
+            &self.mapped_weights,
+            absolute_offset,
+            expert_bytes,
             input,
             output,
         )?;
