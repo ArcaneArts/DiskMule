@@ -7,6 +7,8 @@ use std::{
 use serde::Deserialize;
 use tempfile::TempDir;
 
+use diskmule::gguf::{MetadataArray, MetadataValue, TensorSource};
+
 const MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 
 #[derive(Deserialize)]
@@ -36,6 +38,22 @@ fn installed_gemma_is_listed_inspected_and_protected() {
     let blob = model_blob(&ollama_root, &manifest_path);
     let before = fingerprint(&blob);
     let isolated_home = TempDir::new().unwrap();
+
+    let source = TensorSource::open_with_arrays(&blob, ["tokenizer.ggml.tokens"]).unwrap();
+    assert_eq!(source.gguf.architecture(), Some("gemma4"));
+    let tokens = source
+        .gguf
+        .metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(MetadataValue::as_array)
+        .and_then(MetadataArray::as_strings)
+        .expect("Gemma GGUF should expose its tokenizer vocabulary");
+    assert_eq!(tokens.len(), 262_144);
+    let first_tensor = &source.gguf.tensors[0];
+    let mut tensor_prefix = [0_u8; 16];
+    source
+        .read_tensor_at(&first_tensor.name, 0, &mut tensor_prefix)
+        .unwrap();
 
     let list = diskmule(isolated_home.path(), ["ls"]);
     assert!(list.status.success(), "ls failed: {}", stderr(&list));

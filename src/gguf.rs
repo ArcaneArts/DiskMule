@@ -5,11 +5,15 @@
 //! files.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u32 = 32;
@@ -19,6 +23,8 @@ const MAX_KEY_BYTES: u64 = 64 * 1024;
 const MAX_NAME_BYTES: u64 = 1024 * 1024;
 const MAX_VALUE_STRING_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARRAY_ELEMENTS: u64 = 16_000_000;
+const MAX_CAPTURED_ARRAY_ELEMENTS: u64 = 1_000_000;
+const MAX_CAPTURED_ARRAY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DIMENSIONS: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +113,27 @@ pub enum GgufError {
     #[error("integer overflow while calculating {0}")]
     Overflow(&'static str),
 
+    #[error("captured metadata array {key:?} is too large ({length} elements; limit {limit})")]
+    CapturedArrayTooLarge {
+        key: String,
+        length: u64,
+        limit: u64,
+    },
+
+    #[error("captured metadata array {key:?} exceeds the {limit}-byte memory budget")]
+    CapturedArrayBudget { key: String, limit: u64 },
+
+    #[error("tensor {0:?} was not found in the GGUF index")]
+    TensorNotFound(String),
+
+    #[error("requested range {offset}..{end} exceeds tensor {tensor:?} length {tensor_len}")]
+    TensorReadOutOfBounds {
+        tensor: String,
+        offset: u64,
+        end: u64,
+        tensor_len: u64,
+    },
+
     #[error("could not read GGUF: {0}")]
     Io(#[from] io::Error),
 }
@@ -123,9 +150,68 @@ pub enum MetadataValue {
     Bool(bool),
     String(String),
     Array { element_type: u32, length: u64 },
+    ArrayValues(MetadataArray),
     U64(u64),
     I64(i64),
     F64(f64),
+}
+
+/// Materialized values for metadata arrays explicitly requested by a runtime.
+///
+/// Ordinary inspection retains only an array's type and length. This separate
+/// representation lets tokenizers load vocabulary metadata without making
+/// `diskmule ls` retain hundreds of thousands of strings.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataArray {
+    U8(Vec<u8>),
+    I8(Vec<i8>),
+    U16(Vec<u16>),
+    I16(Vec<i16>),
+    U32(Vec<u32>),
+    I32(Vec<i32>),
+    F32(Vec<f32>),
+    Bool(Vec<bool>),
+    String(Vec<String>),
+    U64(Vec<u64>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+}
+
+impl MetadataArray {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::U8(values) => values.len(),
+            Self::I8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::I16(values) => values.len(),
+            Self::U32(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::F32(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::String(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::F64(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_strings(&self) -> Option<&[String]> {
+        match self {
+            Self::String(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn as_i32s(&self) -> Option<&[i32]> {
+        match self {
+            Self::I32(values) => Some(values),
+            _ => None,
+        }
+    }
 }
 
 impl MetadataValue {
@@ -139,6 +225,13 @@ impl MetadataValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U32(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&MetadataArray> {
+        match self {
+            Self::ArrayValues(values) => Some(values),
             _ => None,
         }
     }
@@ -273,6 +366,25 @@ impl GgufFile {
         Self::read_from(&mut file, file_len, &path.display().to_string())
     }
 
+    /// Parse a GGUF index while retaining values for only the named metadata
+    /// arrays. Scalar and string metadata is always retained.
+    pub fn inspect_with_arrays<I, S>(path: impl AsRef<Path>, keys: I) -> Result<Self, GgufError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let path = path.as_ref();
+        let captured_keys = keys.into_iter().map(Into::into).collect();
+        let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        Self::read_from_with_arrays(
+            &mut file,
+            file_len,
+            &path.display().to_string(),
+            &captured_keys,
+        )
+    }
+
     pub fn architecture(&self) -> Option<&str> {
         self.metadata
             .get("general.architecture")
@@ -295,6 +407,15 @@ impl GgufFile {
         reader: &mut R,
         file_len: u64,
         display_path: &str,
+    ) -> Result<Self, GgufError> {
+        Self::read_from_with_arrays(reader, file_len, display_path, &HashSet::new())
+    }
+
+    fn read_from_with_arrays<R: Read + Seek>(
+        reader: &mut R,
+        file_len: u64,
+        display_path: &str,
+        captured_array_keys: &HashSet<String>,
     ) -> Result<Self, GgufError> {
         let mut input = BoundedReader::new(reader, file_len);
 
@@ -320,7 +441,12 @@ impl GgufFile {
             let key = input.read_string("metadata key", MAX_KEY_BYTES)?;
             let kind_offset = input.position;
             let kind = input.read_u32("metadata value type")?;
-            let value = read_metadata_value(&mut input, kind, kind_offset)?;
+            let value = read_metadata_value(
+                &mut input,
+                kind,
+                kind_offset,
+                captured_array_keys.contains(&key).then_some(key.as_str()),
+            )?;
             if metadata.insert(key.clone(), value).is_some() {
                 return Err(GgufError::DuplicateMetadataKey(key));
             }
@@ -430,6 +556,95 @@ impl GgufFile {
     }
 }
 
+/// An indexed GGUF file that supports bounded positional tensor reads.
+///
+/// The file descriptor is shared safely between readers and every request is
+/// checked against the tensor's declared byte range before any I/O occurs.
+#[derive(Debug)]
+pub struct TensorSource {
+    path: PathBuf,
+    file: Arc<File>,
+    pub gguf: GgufFile,
+    tensor_indices: HashMap<String, usize>,
+}
+
+impl TensorSource {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, GgufError> {
+        Self::open_with_arrays(path, std::iter::empty::<String>())
+    }
+
+    pub fn open_with_arrays<I, S>(path: impl AsRef<Path>, keys: I) -> Result<Self, GgufError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let path = path.as_ref().to_path_buf();
+        let captured_keys = keys.into_iter().map(Into::into).collect();
+        let mut file = File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let gguf = GgufFile::read_from_with_arrays(
+            &mut file,
+            file_len,
+            &path.display().to_string(),
+            &captured_keys,
+        )?;
+        let file = Arc::new(file);
+        let tensor_indices = gguf
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (tensor.name.clone(), index))
+            .collect();
+        Ok(Self {
+            path,
+            file,
+            gguf,
+            tensor_indices,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensor_indices
+            .get(name)
+            .map(|index| &self.gguf.tensors[*index])
+    }
+
+    /// Read a bounded subrange of one tensor without moving shared file state.
+    pub fn read_tensor_at(
+        &self,
+        name: &str,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<(), GgufError> {
+        let tensor = self
+            .tensor(name)
+            .ok_or_else(|| GgufError::TensorNotFound(name.to_owned()))?;
+        let length = u64::try_from(destination.len())
+            .map_err(|_| GgufError::Overflow("tensor read length"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(GgufError::Overflow("tensor read range"))?;
+        if end > tensor.byte_len {
+            return Err(GgufError::TensorReadOutOfBounds {
+                tensor: name.to_owned(),
+                offset,
+                end,
+                tensor_len: tensor.byte_len,
+            });
+        }
+        let absolute_offset = tensor
+            .absolute_offset
+            .checked_add(offset)
+            .ok_or(GgufError::Overflow("absolute tensor read offset"))?;
+        read_exact_at(&self.file, destination, absolute_offset)?;
+        Ok(())
+    }
+}
+
 fn enforce_count(field: &'static str, count: u64, limit: u64) -> Result<(), GgufError> {
     if count > limit {
         return Err(GgufError::CountLimit {
@@ -445,6 +660,7 @@ fn read_metadata_value<R: Read + Seek>(
     input: &mut BoundedReader<'_, R>,
     kind: u32,
     kind_offset: u64,
+    captured_array_key: Option<&str>,
 ) -> Result<MetadataValue, GgufError> {
     Ok(match kind {
         0 => MetadataValue::U8(input.read_u8("U8 metadata value")?),
@@ -473,12 +689,22 @@ fn read_metadata_value<R: Read + Seek>(
             }
             let length = input.read_u64("metadata array length")?;
             enforce_count("metadata array element", length, MAX_ARRAY_ELEMENTS)?;
-            for _ in 0..length {
-                skip_metadata_value(input, element_type, element_offset)?;
-            }
-            MetadataValue::Array {
-                element_type,
-                length,
+            if let Some(key) = captured_array_key {
+                MetadataValue::ArrayValues(read_metadata_array(
+                    input,
+                    element_type,
+                    element_offset,
+                    length,
+                    key,
+                )?)
+            } else {
+                for _ in 0..length {
+                    skip_metadata_value(input, element_type, element_offset)?;
+                }
+                MetadataValue::Array {
+                    element_type,
+                    length,
+                }
             }
         }
         10 => MetadataValue::U64(input.read_u64("U64 metadata value")?),
@@ -491,6 +717,160 @@ fn read_metadata_value<R: Read + Seek>(
             });
         }
     })
+}
+
+fn read_metadata_array<R: Read + Seek>(
+    input: &mut BoundedReader<'_, R>,
+    element_type: u32,
+    element_offset: u64,
+    length: u64,
+    key: &str,
+) -> Result<MetadataArray, GgufError> {
+    if length > MAX_CAPTURED_ARRAY_ELEMENTS {
+        return Err(GgufError::CapturedArrayTooLarge {
+            key: key.to_owned(),
+            length,
+            limit: MAX_CAPTURED_ARRAY_ELEMENTS,
+        });
+    }
+    let capacity = usize::try_from(length)
+        .map_err(|_| GgufError::Overflow("captured metadata array capacity"))?;
+    let fixed_budget = |element_bytes: u64| -> Result<(), GgufError> {
+        let bytes = length
+            .checked_mul(element_bytes)
+            .ok_or(GgufError::Overflow("captured metadata array size"))?;
+        if bytes > MAX_CAPTURED_ARRAY_BYTES {
+            return Err(GgufError::CapturedArrayBudget {
+                key: key.to_owned(),
+                limit: MAX_CAPTURED_ARRAY_BYTES,
+            });
+        }
+        Ok(())
+    };
+
+    macro_rules! read_values {
+        ($variant:ident, $bytes:expr, $read:expr) => {{
+            fixed_budget($bytes)?;
+            let mut values = Vec::with_capacity(capacity);
+            for _ in 0..length {
+                values.push($read?);
+            }
+            MetadataArray::$variant(values)
+        }};
+    }
+
+    Ok(match element_type {
+        0 => read_values!(U8, 1, input.read_u8("U8 metadata array element")),
+        1 => read_values!(
+            I8,
+            1,
+            input.read_u8("I8 metadata array element").map(|v| v as i8)
+        ),
+        2 => read_values!(U16, 2, input.read_u16("U16 metadata array element")),
+        3 => read_values!(
+            I16,
+            2,
+            input
+                .read_u16("I16 metadata array element")
+                .map(|v| v as i16)
+        ),
+        4 => read_values!(U32, 4, input.read_u32("U32 metadata array element")),
+        5 => read_values!(
+            I32,
+            4,
+            input
+                .read_u32("I32 metadata array element")
+                .map(|v| v as i32)
+        ),
+        6 => read_values!(
+            F32,
+            4,
+            input
+                .read_u32("F32 metadata array element")
+                .map(f32::from_bits)
+        ),
+        7 => {
+            fixed_budget(1)?;
+            let mut values = Vec::with_capacity(capacity);
+            for _ in 0..length {
+                let offset = input.position;
+                match input.read_u8("BOOL metadata array element")? {
+                    0 => values.push(false),
+                    1 => values.push(true),
+                    value => return Err(GgufError::InvalidBoolean { value, offset }),
+                }
+            }
+            MetadataArray::Bool(values)
+        }
+        8 => {
+            fixed_budget(std::mem::size_of::<String>() as u64)?;
+            let mut values = Vec::with_capacity(capacity);
+            let mut retained_bytes = length
+                .checked_mul(std::mem::size_of::<String>() as u64)
+                .ok_or(GgufError::Overflow("captured string array size"))?;
+            for _ in 0..length {
+                let value = input.read_string("metadata array string", MAX_VALUE_STRING_BYTES)?;
+                retained_bytes = retained_bytes
+                    .checked_add(value.len() as u64)
+                    .ok_or(GgufError::Overflow("captured string array size"))?;
+                if retained_bytes > MAX_CAPTURED_ARRAY_BYTES {
+                    return Err(GgufError::CapturedArrayBudget {
+                        key: key.to_owned(),
+                        limit: MAX_CAPTURED_ARRAY_BYTES,
+                    });
+                }
+                values.push(value);
+            }
+            MetadataArray::String(values)
+        }
+        9 => return Err(GgufError::NestedArray(element_offset)),
+        10 => read_values!(U64, 8, input.read_u64("U64 metadata array element")),
+        11 => read_values!(
+            I64,
+            8,
+            input
+                .read_u64("I64 metadata array element")
+                .map(|v| v as i64)
+        ),
+        12 => read_values!(
+            F64,
+            8,
+            input
+                .read_u64("F64 metadata array element")
+                .map(f64::from_bits)
+        ),
+        _ => {
+            return Err(GgufError::UnknownMetadataType {
+                kind: element_type,
+                offset: element_offset,
+            });
+        }
+    })
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut destination: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !destination.is_empty() {
+        match file.read_at(destination, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(read) => {
+                offset = offset
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("positional read offset overflow"))?;
+                destination = &mut destination[read..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, destination: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read_exact(destination)
 }
 
 fn skip_metadata_value<R: Read + Seek>(
@@ -679,12 +1059,19 @@ impl<'a, R: Read + Seek> BoundedReader<'a, R> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        collections::HashSet,
+        io::{Cursor, Write},
+        sync::Arc,
+        thread,
+    };
 
-    use super::{GgufError, GgufFile, MetadataValue, TensorType};
+    use super::{GgufError, GgufFile, MetadataArray, MetadataValue, TensorSource, TensorType};
 
+    const I32: u32 = 5;
     const U32: u32 = 4;
     const STRING: u32 = 8;
+    const ARRAY: u32 = 9;
 
     struct Fixture {
         bytes: Vec<u8>,
@@ -708,7 +1095,7 @@ mod tests {
             put_u32(&mut bytes, 2);
             put_u64(&mut bytes, 0);
             pad_to(&mut bytes, 32);
-            bytes.extend_from_slice(&[0_u8; 18]);
+            bytes.extend(0_u8..18);
             Self { bytes }
         }
 
@@ -867,6 +1254,96 @@ mod tests {
         assert!(matches!(parsed, Err(GgufError::Truncated { .. })));
     }
 
+    #[test]
+    fn captures_only_requested_metadata_arrays() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        put_u32(&mut bytes, 3);
+        put_u64(&mut bytes, 0);
+        put_u64(&mut bytes, 2);
+        put_string_array_metadata(&mut bytes, "tokenizer.ggml.tokens", &["hello", " world"]);
+        put_i32_array_metadata(&mut bytes, "tokenizer.ggml.token_type", &[1, 6]);
+        pad_to(&mut bytes, 32);
+
+        let mut summary_cursor = Cursor::new(&bytes);
+        let summary =
+            GgufFile::read_from(&mut summary_cursor, bytes.len() as u64, "tokenizer.gguf").unwrap();
+        assert_eq!(
+            summary.metadata.get("tokenizer.ggml.tokens"),
+            Some(&MetadataValue::Array {
+                element_type: STRING,
+                length: 2,
+            })
+        );
+
+        let requested = HashSet::from([
+            "tokenizer.ggml.tokens".to_owned(),
+            "tokenizer.ggml.token_type".to_owned(),
+        ]);
+        let mut captured_cursor = Cursor::new(&bytes);
+        let captured = GgufFile::read_from_with_arrays(
+            &mut captured_cursor,
+            bytes.len() as u64,
+            "tokenizer.gguf",
+            &requested,
+        )
+        .unwrap();
+        assert_eq!(
+            captured
+                .metadata
+                .get("tokenizer.ggml.tokens")
+                .and_then(MetadataValue::as_array)
+                .and_then(MetadataArray::as_strings),
+            Some(["hello".to_owned(), " world".to_owned()].as_slice())
+        );
+        assert_eq!(
+            captured
+                .metadata
+                .get("tokenizer.ggml.token_type")
+                .and_then(MetadataValue::as_array)
+                .and_then(MetadataArray::as_i32s),
+            Some([1, 6].as_slice())
+        );
+    }
+
+    #[test]
+    fn tensor_source_reads_checked_ranges_concurrently() {
+        let fixture = Fixture::valid();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&fixture.bytes).unwrap();
+        file.flush().unwrap();
+
+        let source = Arc::new(TensorSource::open(file.path()).unwrap());
+        assert_eq!(source.path(), file.path());
+        assert_eq!(source.tensor("weight").unwrap().byte_len, 18);
+
+        let readers: Vec<_> = [(0_u64, vec![0, 1, 2, 3]), (10, vec![10, 11, 12, 13])]
+            .into_iter()
+            .map(|(offset, expected)| {
+                let source = Arc::clone(&source);
+                thread::spawn(move || {
+                    let mut actual = vec![0_u8; expected.len()];
+                    source
+                        .read_tensor_at("weight", offset, &mut actual)
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+
+        assert!(matches!(
+            source.read_tensor_at("missing", 0, &mut [0]),
+            Err(GgufError::TensorNotFound(_))
+        ));
+        assert!(matches!(
+            source.read_tensor_at("weight", 17, &mut [0; 2]),
+            Err(GgufError::TensorReadOutOfBounds { .. })
+        ));
+    }
+
     fn put_u32_metadata(bytes: &mut Vec<u8>, key: &str, value: u32) {
         put_string(bytes, key);
         put_u32(bytes, U32);
@@ -877,6 +1354,26 @@ mod tests {
         put_string(bytes, key);
         put_u32(bytes, STRING);
         put_string(bytes, value);
+    }
+
+    fn put_string_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[&str]) {
+        put_string(bytes, key);
+        put_u32(bytes, ARRAY);
+        put_u32(bytes, STRING);
+        put_u64(bytes, values.len() as u64);
+        for value in values {
+            put_string(bytes, value);
+        }
+    }
+
+    fn put_i32_array_metadata(bytes: &mut Vec<u8>, key: &str, values: &[i32]) {
+        put_string(bytes, key);
+        put_u32(bytes, ARRAY);
+        put_u32(bytes, I32);
+        put_u64(bytes, values.len() as u64);
+        for value in values {
+            put_u32(bytes, *value as u32);
+        }
     }
 
     fn put_string(bytes: &mut Vec<u8>, value: &str) {
