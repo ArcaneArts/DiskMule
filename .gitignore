@@ -1,3 +1,5 @@
 # Local reference repositories for agents; each directory is its own checkout.
 projects/
 
+# Rust build output.
+target/
