@@ -182,6 +182,8 @@ copying the Ollama blob.
 
 ### Phase 2: Gemma 4 CPU correctness slice
 
+Status: complete on 2026-08-18 for the pinned local `gemma4:26b` GGUF.
+
 - Implement the Gemma 4 tokenizer and chat rendering.
 - Add only the CPU operators required for a deterministic single-token forward
   pass.
@@ -191,6 +193,15 @@ copying the Ollama blob.
 
 Exit criterion: deterministic Gemma 4 prompts match the reference within stated
 numeric tolerances and choose the same expected tokens.
+
+Evidence: DiskMule's read-only mapped CPU graph executes the complete Gemma 4
+text block and reuses a bounded KV cache across decode. Against Ollama 0.32.14
+and exact GGUF digest
+`7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, the
+four-token greedy sequence is exactly `47610, 1852, 2624, 1852`; the first
+token's normalized log probability is `-4.0262756` versus Ollama's
+`-4.0249696`. A live `diskmule run gemma4:26b` CPU session streamed a bounded
+response and handled clear and exit commands.
 
 ### Phase 3: Metal Gemma 4 inference
 
@@ -266,9 +277,10 @@ server, CLI, or session code unless it introduces a genuinely new capability.
 - Change one performance variable at a time.
 - Never claim support based only on successful metadata parsing.
 
-## Immediate milestone
+## Current milestone
 
-Build the Phase 0 and Phase 1 vertical slice so that these commands work:
+Build Phase 3 Metal inference without weakening the proven CPU oracle or model
+ownership boundary. These commands already work:
 
 ```text
 diskmule ls
@@ -277,8 +289,7 @@ diskmule rm gemma4:26b
 diskmule --serve
 ```
 
-At this milestone, `ls` should identify the Ollama-owned Gemma model,
-`run` should resolve and inspect it before reporting that inference is not yet
-implemented, `rm` should safely refuse to delete it, and `--serve` should start
-a minimal health endpoint. This establishes the public contract and ownership
-rules before expensive inference work begins.
+`ls` identifies the Ollama-owned Gemma model, `run` provides CPU chat, `rm`
+safely refuses external deletion, and `--serve` provides a minimal health
+endpoint. Phase 3 must add DiskMule-owned Metal execution with per-operation and
+end-to-end parity before it becomes the default chat backend.

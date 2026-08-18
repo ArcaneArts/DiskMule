@@ -75,6 +75,40 @@ Notable transferable ideas and measurements:
 - End-to-end measurements rejected several plausible optimizations: demand-paged `mmap` for cold experts, unstable read-ahead hints, speculative cross-layer reads, MTLIO under cold conditions, overly fine-grained overlap, and excessive kernel fusion.
 - TurboFieldfare measured a cold expert access at about 9.88 ms through demand paging versus about 2.79 ms using explicit `pread`.
 
+## DiskMule Gemma 4 correctness findings
+
+The Phase 2 implementation validated the actual Ollama GGUF rather than relying
+only on the reference projects' repacked formats. Important container-specific
+details are:
+
+- The text tower is 30 layers with 25 sliding-window and five full-attention
+  layers, 2,816 hidden features, 16 query heads, 128 routed experts, top-8
+  routing, a 2,112-wide shared expert, and 704-wide routed experts.
+- Full-attention layers omit `attn_v.weight` and derive the unnormalized V
+  projection from K before applying an unweighted per-head RMSNorm.
+- `rope_freqs.weight` contains 128 factors of `1.0` followed by 128 factors of
+  `1e30`. This represents Gemma 4's 0.25 proportional partial-RoPE behavior;
+  treating all 512 full-attention head dimensions as rotated changes output.
+- The shared expert output uses `post_ffw_norm_1.weight`; the combined shared
+  plus routed output then uses `post_ffw_norm.weight`. Swapping these still
+  produced finite plausible output but failed the exact token oracle.
+- The GGUF tokenizer advertises `llama` plus the `gemma4` pre-tokenizer but is
+  scored SentencePiece in llama.cpp behavior; the stored merge table is not the
+  runtime merge algorithm.
+
+For pinned digest
+`7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, Ollama
+0.32.14 generated token IDs `47610, 1852, 2624, 1852` from a raw BOS prompt at
+temperature zero. DiskMule matches all four IDs. Ollama reported a first-token
+log probability of `-4.0249696`; DiskMule computes `-4.0262756`, an absolute
+difference of about `0.00131` under the Phase 2 tolerance of `0.02`.
+
+The authoritative llama.cpp sources used to verify GGUF quantization,
+tokenization, tensor naming, and Gemma graph ordering include
+`ggml-quants.c`, `ggml-common.h`, `src/llama-vocab.cpp`,
+`src/llama-arch.cpp`, `src/llama-graph.cpp`, and `src/models/gemma4.cpp`.
+Reference source is not copied into DiskMule.
+
 ## Expert caching strategy
 
 Do not rely exclusively on macOS cached/inactive RAM. The OS file cache is useful as a best-effort second-chance layer, but it is not an expert cache:

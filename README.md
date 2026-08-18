@@ -1,14 +1,16 @@
 # DiskMule
 
-DiskMule is an original Rust inference runtime under construction for Apple
+DiskMule is an original Rust inference runtime for Apple
 Silicon. Its long-term purpose is to run multiple explicitly supported model
 families while keeping very large routed-expert pools on storage. Rust owns the
-host runtime and future GPU kernels will be written in Metal Shading Language.
+host runtime and GPU kernels will be written in Metal Shading Language.
 
-The current first pass implements the model-management boundary only. It can
-inspect GGUF metadata, discover local Ollama models without copying them,
-safely manage DiskMule-owned entries, and serve a health endpoint. It does not
-perform inference yet.
+The current implementation includes the model-management boundary and a
+complete deterministic Gemma 4 26B CPU reference path. It can inspect and map
+GGUF tensors, discover local Ollama models without copying them, safely manage
+DiskMule-owned entries, run streaming terminal chat, and serve a health
+endpoint. Metal inference, explicit expert streaming, and generation APIs are
+the next active phases.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
 for the Colibri and TurboFieldfare research behind it.
@@ -34,21 +36,26 @@ diskmule ls
 ```
 
 The output identifies each model's architecture, quantization, size, owner, and
-status. `metadata-compatible; inference pending` means the complete GGUF
-metadata and tensor ranges passed inspection; it is deliberately not a claim
-that inference is implemented.
+status. `metadata-compatible` means the GGUF metadata and tensor ranges passed
+bounded inspection. The architecture runtime performs its stricter complete
+configuration and tensor-shape validation when a prompt first loads the model.
 
-Inspect a named model or a direct local GGUF path:
+Start an interactive chat with a named model or direct local GGUF path:
 
 ```bash
 diskmule run gemma4:26b
 diskmule run /path/to/model.gguf
 ```
 
-For this milestone, `run` prints the resolved source, path, architecture,
-quantization, GGUF version, tensor count, alignment, and tensor-data offset,
-then exits with an explicit `model inference is not implemented yet` error.
-Interactive chat is scheduled for the later inference phases in `PLAN.md`.
+`run` prints the resolved model details and starts an EOF-safe terminal loop.
+Enter `/clear` to reset history, `/help` for local commands, or `/bye` to exit.
+Generation is greedy and streams through DiskMule's own CPU runtime. Two
+temporary development controls bound generation while the richer Phase 5 CLI
+surface is being built:
+
+```bash
+DISKMULE_CONTEXT=4096 DISKMULE_MAX_TOKENS=64 diskmule run gemma4:26b
+```
 
 Remove a DiskMule-owned model:
 
@@ -123,16 +130,21 @@ RUST_LOG=diskmule=debug diskmule --serve
 
 ## GGUF inspection boundary
 
-The reader supports GGUF versions 2 and 3 and reads only the header, metadata,
-and tensor descriptors. It validates bounded counts and string lengths, UTF-8,
-metadata types, tensor types and quantized block shapes, dimensions, checked
-size arithmetic, alignment, file bounds, duplicate names, and overlapping
-ranges. Tensor payload bytes are not loaded during discovery or `run`.
+The reader supports GGUF versions 2 and 3. Discovery reads only the header,
+metadata, and tensor descriptors; it never loads payloads. Runtime loading adds
+a validated read-only mapping for zero-copy tensor views while retaining
+bounded positional reads for explicit expert streaming. Validation covers
+bounded counts and strings, UTF-8, metadata and tensor types, quantized block
+shapes, dimensions, checked size arithmetic, alignment, file bounds, duplicate
+names, and overlapping ranges.
 
-The first pass recognizes the tensor encodings needed by the local
-`gemma4:26b` Q4_K_M model. A syntactically valid model using an unimplemented
-architecture or tensor type is reported as unsupported or invalid rather than
-being presented as runnable.
+The CPU reference implements the tensor encodings used by the local
+`gemma4:26b` Q4_K_M model: F32, F16, Q4_K, Q5_0, Q6_K, and Q8_0. Its Gemma
+module owns proportional/SWA RoPE, grouped-query attention, Q/K/V norms,
+parallel shared and routed experts, sandwich residuals, tied output projection,
+softcapping, greedy selection, KV reuse, cancellation checks, and phase timing.
+A syntactically valid file using an unimplemented architecture or tensor type
+is reported as unsupported rather than being presented as runnable.
 
 ## Verification
 
@@ -146,5 +158,18 @@ cargo test --all-targets --all-features
 
 The test suite generates tiny GGUF fixtures; it does not copy real model data.
 When the local Ollama `gemma4:26b` manifest is present, an environment-aware
-smoke test also confirms listing, inspection, refusal of external removal, and
-unchanged blob metadata.
+smoke test also confirms tensor execution at real offsets, listing, inspection,
+refusal of external removal, and unchanged blob metadata.
+
+The expensive pinned correctness oracle is separate from the fast gate:
+
+```bash
+cargo test --release --test gemma4_cpu_reference -- --ignored --nocapture
+```
+
+For GGUF digest
+`7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, it
+compares DiskMule with a temperature-zero Ollama 0.32.14 run. The four generated
+token IDs match exactly (`47610, 1852, 2624, 1852`), and the first token's
+normalized log probability differs by about 0.00131 under the documented 0.02
+tolerance.
