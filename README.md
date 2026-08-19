@@ -6,17 +6,17 @@ families while keeping very large routed-expert pools on storage. Rust owns the
 host runtime and GPU kernels will be written in Metal Shading Language.
 
 The current implementation includes the model-management boundary, complete
-deterministic Gemma 4 26B CPU and Metal paths, fixture-validated GLM-5.2
-CPU/Metal execution over sharded safetensors, and the installed
+deterministic Gemma 4 26B CPU and Metal paths, full-checkpoint-validated
+GLM-5.2 out-of-core Metal execution over sharded safetensors, and the installed
 `qwen3.8:latest` Q4_K_M model through a Qwen3.5 hybrid recurrent-attention
 graph with CPU correctness execution and Metal matrix offload. It can inspect
 and map GGUF tensors, discover local Ollama models without copying them, safely
 manage DiskMule-owned entries, run streaming terminal chat, retain bounded
 generation state, and force routed experts through explicit storage-backed
 caches. The CLI and Ollama-compatible HTTP server share bounded model workers,
-persistent sessions, deterministic sampling, streaming, and cancellation. A
-real hundreds-of-gigabytes GLM-5.2 checkpoint is still required before claiming
-full-model correctness or out-of-core performance.
+persistent sessions, deterministic sampling, streaming, and cancellation. The
+complete roughly 400 GiB GLM-5.2 checkpoint matches Colibri's greedy tokens
+while retaining less than 1.6 GB of routed experts in forced one-slot mode.
 
 See [PLAN.md](PLAN.md) for the staged implementation plan and [NOTES.md](NOTES.md)
 for the Colibri and TurboFieldfare research behind it.
@@ -214,7 +214,9 @@ Metal dispatches the same dense and cached-expert encodings directly from shard
 mappings or bounded resident slots. Generation profiles include logical tensor
 bytes, resident KV/DSA bytes, cache reads/hits/misses/evictions/I/O wait, and
 phase timings. Tiny deterministic fixtures prove CPU/dequantized and CPU/Metal
-parity but are not treated as full GLM evidence.
+parity. The separate real-model oracle also proves exact Colibri greedy-token
+parity and nonzero bounded expert-cache reads, misses, evictions, and residency
+on the complete checkpoint.
 
 DSA indexer weights are an optional all-or-none sidecar. A snapshot without
 them uses exact dense attention; a partial sidecar is rejected. This permits the
@@ -252,7 +254,8 @@ cargo test --release --test gemma4_server_reference -- --ignored --nocapture
 DISKMULE_GLM52_METADATA=/path/to/glm-metadata \
   cargo test --test glm52_tokenizer_reference -- --ignored --nocapture
 DISKMULE_GLM52_SNAPSHOT=/path/to/glm-snapshot \
-  cargo test --test glm52_reference -- --ignored --nocapture
+DISKMULE_GLM_EXPERT_SLOTS=1 DISKMULE_GLM_DIRECT=1 \
+  cargo test --release --test glm52_reference -- --ignored --nocapture
 cargo test --release --test qwen35_reference -- --ignored --nocapture
 cargo test --release --test qwen35_server_reference -- --ignored --nocapture
 ```
@@ -264,10 +267,15 @@ shards. It pins exact Hugging Face tokenizer IDs and validates the checkpoint's
 154,880-row padded model vocabulary against its 154,856 defined tokenizer IDs.
 Undefined padded output rows are excluded from sampling.
 
-The GLM snapshot oracle indexes all real shards, checks the exact audited
+The GLM snapshot oracle first indexes all real shards, checks the exact audited
 tensor/dtype counts, and applies the complete ordinary-decode tensor contract
-without loading tensor payloads. It is intentionally separate from the routine
-gate because the checkpoint is about 400 GB.
+without loading tensor payloads. Its second ignored test runs the exact
+seven-token Colibri chat prompt through forced-streaming Metal, requires the
+same four greedy IDs `13041, 0, 358, 2776`, and verifies cache and KV metrics.
+It is intentionally separate from the routine gate because the checkpoint is
+about 400 GiB and the correctness-first dense-attention path is slow. Full
+conditions and measurements are in
+[`benchmarks/2026-08-18-glm52-m4-max.md`](benchmarks/2026-08-18-glm52-m4-max.md).
 
 For GGUF digest
 `7121486771cbfe218851513210c40b35dbdee93ab1ef43fe36283c883980f0df`, it

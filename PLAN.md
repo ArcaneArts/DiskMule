@@ -284,11 +284,8 @@ shutdown. CLI and both server modes produced the same configured greedy
 
 ### Phase 6: GLM-5.2 and genuine out-of-core operation
 
-Status: safe implementation complete for deterministic tiny CPU/Metal fixtures,
-including the recommended Colibri grouped-INT4 container. A complete
-user-supplied checkpoint is now available and has passed the payload-lazy real
-metadata/tensor-contract oracle; full-model inference and performance sweeps
-are in progress.
+Status: complete on 2026-08-18 for the complete user-supplied Colibri
+grouped-INT4 checkpoint under forced one-slot out-of-core Metal execution.
 
 - Add safetensors indexing and the GLM-5.2 architecture module.
 - Port only the GLM-specific semantics required for correct inference, using
@@ -364,6 +361,27 @@ ordinary layers, 75 sparse layers, 256 experts per sparse layer, grouped-INT4
 geometry, and the intentionally absent DSA sidecar. No model payload was copied
 or committed.
 
+The full forced-streaming oracle now closes the exit criterion. For the exact
+seven-ID chat prompt, DiskMule and Colibri select the same four greedy IDs
+`13041, 0, 358, 2776`, decoded as `Hi! I'm`. DiskMule retained only one expert
+slot per sparse layer (1,592,524,800 bytes, versus an approximately 370 GB
+expert pool), recorded 5,995 misses, 5,920 evictions, 35,970 positional reads,
+127,295,815,680 explicit expert bytes, nonzero I/O wait, and zero process swaps.
+The four-token direct-I/O profile took 492.49 seconds to first token and 705.60
+seconds total; exact dense attention consumed 658.62 seconds because the
+checkpoint lacks a DSA sidecar. This is a correctness and bounded-residency
+result, not a Colibri-class throughput claim.
+
+A controlled first-observed sweep compared direct and buffered one-slot reads
+and a buffered eight-slot cache. All selected the same first token and incurred
+zero process swaps. Buffered one-slot took 461.94 seconds; eight slots raised
+the hit rate from effectively zero to 19.4% and cut expert bytes by 19.4%, but
+took 484.64 seconds because attention dominated. The approximately 96 GB cache
+point was not attempted on a busy host after the smaller sweep showed no
+wall-time benefit and the system already had compressor/swap history. Exact
+conditions, raw counters, ordering caveats, and the Colibri oracle are retained
+in `benchmarks/2026-08-18-glm52-m4-max.md`.
+
 ### Phase 7: broaden model support
 
 Status: complete on 2026-08-18 for the pinned local `qwen3.8:latest` Q4_K_M
@@ -417,11 +435,10 @@ the real graph and CLI/server worker paths.
 
 ## Current milestone
 
-All safe Phase 6 implementation work, including Colibri grouped-INT4 CPU,
-Metal, streamed-expert execution, real tokenizer verification, and full local
-checkpoint contract validation is complete, and Phase 7 is complete. The
-remaining goal work is the real GLM-5.2 ordinary-decode oracle, forced
-out-of-core parity, and controlled performance sweep. These commands work:
+Phases 0–7 are implemented. Gemma 4, GLM-5.2, and Qwen3.5/Qwen3.8 have pinned
+real-model generation evidence; GLM-5.2 additionally has exact Colibri token
+parity under forced out-of-core execution and a controlled local storage/cache
+sweep. These commands work:
 
 ```text
 diskmule ls
@@ -434,7 +451,7 @@ diskmule --serve
 `ls` identifies the Ollama-owned models, `run` provides cancellable Metal chat
 on supported Apple Silicon with an explicit CPU fallback, `rm` safely refuses
 external deletion, and `--serve` provides bounded streaming and non-streaming
-chat. Qwen3.8 is verified through the same CLI and server. GLM fixture-backed
-safetensors, CPU, Metal, session, profiling, and storage-backed expert
-semantics are implemented. A full Phase 6 claim still requires successful
-ordinary decoding and out-of-core evidence from the now-available real model.
+chat. Qwen3.8 is verified through the same CLI and server. GLM ordinary decode
+is correct and bounded on the complete roughly 400 GiB checkpoint, although
+its correctness-first dense MLA path remains much slower than Colibri when the
+snapshot has no DSA sidecar.

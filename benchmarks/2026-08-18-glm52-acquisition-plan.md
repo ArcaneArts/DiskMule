@@ -137,10 +137,14 @@ decode throughput, CPU/GPU phase time, hits/misses/evictions, bytes and reads pe
 token, I/O wait, RSS, physical footprint, memory pressure, compression, and
 thermal/power caveats. Record correctness beside performance.
 
-## Completion condition
+## Completion result
 
-Phase 6 remains incomplete until a real run proves ordinary GLM-5.2 generation
-with the complete expert pool larger than unified memory, explicit bounded
-expert residency, correct forced-streaming parity, and reproducible performance
-logs. Re-run the full repository verification gate and the Ollama fingerprint
-afterward; all work must be committed and the tree clean.
+Phase 6 completed on 2026-08-18. The complete checkpoint produced exact
+Colibri greedy IDs `13041, 0, 358, 2776` under DiskMule's Metal path with one
+expert slot per sparse layer. The 1,592,524,800-byte explicit expert residency
+is bounded far below the approximately 370 GB routed pool; misses, evictions,
+positional reads, bytes, I/O wait, KV residency, and zero process swaps were
+recorded. Direct/buffered one-slot and buffered eight-slot observations retained
+the same first token. The detailed correctness oracle, performance counters,
+memory-pressure caveats, and decision not to risk a 96 GB cache on a busy host
+are in `benchmarks/2026-08-18-glm52-m4-max.md`.

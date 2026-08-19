@@ -216,16 +216,25 @@ default. `DISKMULE_GLM_DIRECT=1` applies `F_NOCACHE` to each safetensors shard
 descriptor on macOS for a controlled direct-versus-buffered experiment. No
 performance conclusion has been drawn from the tiny fixture.
 
-This closed safe implementation work but did not by itself close Phase 6. The
-user later supplied the complete recommended grouped-INT4 repository outside
-the DiskMule workspace. Its metadata digests match the audited revision; its
-141 ordinary shards total `419,296,541,560` bytes and its MTP shard is
-`9,959,321,520` bytes. DiskMule's payload-lazy real-snapshot oracle indexes all
-142 shards and 118,478 unique tensors, validates the 78-layer ordinary graph
-and all 19,200 routed experts, and confirms the expected absence of the DSA
-sidecar. Full out-of-core correctness, cache-budget sweeps, memory-pressure
-measurements, and reproducible performance logs remain Phase 6 work until real
-ordinary decoding succeeds.
+The user later supplied the complete recommended grouped-INT4 repository
+outside the DiskMule workspace. Its metadata digests match the audited
+revision; its 141 ordinary shards total `419,296,541,560` bytes and its MTP
+shard is `9,959,321,520` bytes. DiskMule's payload-lazy real-snapshot oracle
+indexes all 142 shards and 118,478 unique tensors, validates the 78-layer
+ordinary graph and all 19,200 routed experts, and confirms the expected absence
+of the DSA sidecar.
+
+The real ordinary-decode oracle then matched Colibri's greedy IDs
+`13041, 0, 358, 2776` exactly for the complete chat envelope. With one slot per
+sparse layer, DiskMule retained 1,592,524,800 expert bytes, read
+127,295,815,680 expert bytes across the four-token run, evicted 5,920 entries,
+and incurred zero process swaps. A buffered/direct and one/eight-slot sweep
+preserved the first greedy ID. Eight slots raised hit rate to 19.4% and reduced
+expert reads by 19.4%, but did not improve wall time because exact dense
+attention dominated. This closes Phase 6 correctness and residency while
+leaving absorbed/fused MLA or a complete compatible DSA sidecar as a real
+performance opportunity. Conditions and caveats are retained in
+`benchmarks/2026-08-18-glm52-m4-max.md`.
 
 ## DiskMule Qwen3.5/Qwen3.8 findings
 

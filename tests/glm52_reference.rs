@@ -74,10 +74,20 @@ fn forced_streaming_metal_decode_matches_the_colibri_oracle() {
         eprintln!("skipping: DISKMULE_GLM52_SNAPSHOT is unavailable");
         return;
     };
-    assert_eq!(
-        env::var("DISKMULE_GLM_EXPERT_SLOTS").as_deref(),
-        Ok("1"),
-        "run the forced-streaming oracle with DISKMULE_GLM_EXPERT_SLOTS=1"
+    let expert_slots = env::var("DISKMULE_GLM_EXPERT_SLOTS")
+        .expect("set DISKMULE_GLM_EXPERT_SLOTS explicitly for the forced-streaming oracle")
+        .parse::<usize>()
+        .unwrap();
+    assert!(
+        (1..256).contains(&expert_slots),
+        "the forced-streaming oracle requires fewer than all 256 experts per layer"
+    );
+    let generated_tokens = env::var("DISKMULE_GLM52_ORACLE_TOKENS")
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(4);
+    assert!(
+        (1..=4).contains(&generated_tokens),
+        "DISKMULE_GLM52_ORACLE_TOKENS must be between 1 and 4"
     );
 
     let model = Glm52CpuModel::from_directory_with_context_and_metal(&directory, 64).unwrap();
@@ -95,7 +105,7 @@ fn forced_streaming_metal_decode_matches_the_colibri_oracle() {
         .generate_session_with_selector(
             &mut session,
             &prompt,
-            4,
+            generated_tokens,
             &CancellationFlag::default(),
             greedy,
             |_, _| {},
@@ -103,8 +113,10 @@ fn forced_streaming_metal_decode_matches_the_colibri_oracle() {
         .unwrap();
     eprintln!("DiskMule GLM token IDs: {:?}", result.token_ids);
     eprintln!("DiskMule GLM profile: {:#?}", result.profile);
-    assert_eq!(result.token_ids, [13_041, 0, 358, 2_776]);
-    assert_eq!(result.text, "Hi! I'm");
+    let expected_tokens = [13_041, 0, 358, 2_776];
+    let expected_text = ["Hi", "Hi!", "Hi! I", "Hi! I'm"];
+    assert_eq!(result.token_ids, expected_tokens[..generated_tokens]);
+    assert_eq!(result.text, expected_text[generated_tokens - 1]);
     assert!(result.profile.mapped_bytes_touched > 0);
     assert!(result.profile.expert_cache_misses > 0);
     assert!(result.profile.expert_cache_evictions > 0);
