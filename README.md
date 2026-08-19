@@ -3,7 +3,7 @@
 DiskMule is an original Rust inference runtime for Apple
 Silicon. Its long-term purpose is to run multiple explicitly supported model
 families while keeping very large routed-expert pools on storage. Rust owns the
-host runtime and GPU kernels will be written in Metal Shading Language.
+host runtime and GPU kernels are written in Metal Shading Language.
 
 The current implementation includes the model-management boundary, complete
 deterministic Gemma 4 26B CPU and Metal paths, full-checkpoint-validated
